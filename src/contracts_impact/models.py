@@ -36,8 +36,8 @@ class TopicSubscribed(BaseModel):
     topic: str
     handler: str | None = None
     line: int | None = None
-    push_endpoint: str | None = None
-    dlq: str | None = None
+
+    model_config = ConfigDict(extra="ignore")
 
 
 class EventSchemaRef(BaseModel):

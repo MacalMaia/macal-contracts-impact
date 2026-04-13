@@ -8,8 +8,7 @@ from contracts_impact.models import (
     ExtractionWarning,
     TopicPublished,
 )
-
-PLATFORM_INIT_PUBSUB = Path.home() / "macal" / "auction-engine" / "scripts" / "init-pubsub.py"
+from contracts_impact.platform_topics import topic_names
 
 
 def extract(
@@ -20,7 +19,7 @@ def extract(
     schema_names = {s.class_name for s in schemas}
 
     settings_defaults = _load_settings_defaults(repo_root)
-    platform_topics = _load_platform_topics()
+    platform_topics = topic_names()
 
     publishers: list[TopicPublished] = []
     warnings: list[ExtractionWarning] = []
@@ -144,35 +143,6 @@ def _infer_topic_from_setting(setting_name: str, platform_topics: list[str]) -> 
     if len(matches) == 1:
         return matches[0]
     return None
-
-
-def _load_platform_topics() -> list[str]:
-    """Parse auction-engine/scripts/init-pubsub.py for the canonical topic list."""
-    if not PLATFORM_INIT_PUBSUB.exists():
-        return []
-    try:
-        tree = ast.parse(PLATFORM_INIT_PUBSUB.read_text(), filename=str(PLATFORM_INIT_PUBSUB))
-    except SyntaxError:
-        return []
-    topics: list[str] = []
-    for node in tree.body:
-        if not isinstance(node, ast.Assign):
-            continue
-        if not (len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)):
-            continue
-        if node.targets[0].id != "TOPICS":
-            continue
-        if not isinstance(node.value, ast.List):
-            continue
-        for elt in node.value.elts:
-            if not isinstance(elt, ast.Dict):
-                continue
-            for key, value in zip(elt.keys, elt.values, strict=False):
-                if not (isinstance(key, ast.Constant) and key.value == "topic"):
-                    continue
-                if isinstance(value, ast.Constant) and isinstance(value.value, str):
-                    topics.append(value.value)
-    return topics
 
 
 def _detect_schema_in_func(
