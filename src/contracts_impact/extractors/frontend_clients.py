@@ -187,7 +187,16 @@ def _walk_source_files(repo_root: Path):
             if Path(fname).suffix not in SOURCE_EXTS:
                 continue
             results.append(Path(dirpath) / fname)
-    yield from sorted(results)
+    sorted_results = sorted(results)
+    import sys as _sys
+    print(f"[contracts-impact debug] walked {len(sorted_results)} source files", file=_sys.stderr)
+    adjudic = [f for f in sorted_results if "adjudicaciones" in str(f)]
+    crawler = [f for f in sorted_results if "crawler-search" in str(f)]
+    print(f"[contracts-impact debug] adjudicaciones files: {len(adjudic)}", file=_sys.stderr)
+    print(f"[contracts-impact debug] crawler-search files: {len(crawler)}", file=_sys.stderr)
+    for f in crawler[:6]:
+        print(f"[contracts-impact debug]   {f}", file=_sys.stderr)
+    yield from sorted_results
 
 
 def _scan_local_env_vars(source: str) -> dict[str, str]:
