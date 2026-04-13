@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
@@ -66,8 +65,6 @@ class ExtractionWarning(BaseModel):
 
 class ServiceContracts(BaseModel):
     service: str
-    repo_path: str
-    extracted_at: datetime
     extractor_version: str = "0.1.0"
     provides: Provides = Field(default_factory=Provides)
     consumes: Consumes = Field(default_factory=Consumes)
@@ -76,12 +73,10 @@ class ServiceContracts(BaseModel):
         default_factory=list, alias="_extraction_warnings"
     )
 
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
     @classmethod
     def new(cls, service: str, repo_path: Path) -> ServiceContracts:
-        return cls(
-            service=service,
-            repo_path=str(repo_path),
-            extracted_at=datetime.now(UTC),
-        )
+        # repo_path is accepted for API compat but no longer stored — git history
+        # tracks when the file changed and the file path identifies the service.
+        return cls(service=service)
