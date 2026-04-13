@@ -40,9 +40,10 @@ def cli() -> None:
 @click.argument("service", required=False)
 @click.option(
     "--macal-root",
-    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    type=click.Path(file_okay=False, path_type=Path),
     default=DEFAULT_MACAL_ROOT,
     show_default=True,
+    help="Parent directory containing all macal repos. Ignored when --repo-path is set.",
 )
 @click.option(
     "--repo-path",
@@ -57,6 +58,10 @@ def extract(
     """Run extractors for a service (or all known services if omitted)."""
     if repo_path is not None and service is None:
         console.print("[red]--repo-path requires a service name argument[/red]")
+        raise click.Abort
+
+    if repo_path is None and not macal_root.exists():
+        console.print(f"[red]--macal-root {macal_root} does not exist (use --repo-path . in CI)[/red]")
         raise click.Abort
 
     targets = [service] if service else _discover_services(macal_root)
