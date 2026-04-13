@@ -23,6 +23,7 @@ FRONTEND_SERVICES: set[str] = {
 
 def find_app_root(service_dir: Path) -> Path:
     """Some repos nest the app: ~/macal/payment-gateway/payment-gateway/app/."""
+    service_dir = service_dir.resolve()
     if (service_dir / "app").is_dir():
         return service_dir
     nested = service_dir / service_dir.name
