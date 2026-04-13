@@ -37,6 +37,7 @@ SKIP_DIRS: set[str] = {
     "venv",
     "public",
     "static",
+    ".claude",
 }
 
 SOURCE_EXTS: set[str] = {".ts", ".tsx", ".js", ".jsx", ".vue", ".mjs"}

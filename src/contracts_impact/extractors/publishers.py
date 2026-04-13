@@ -8,7 +8,6 @@ from contracts_impact.models import (
     ExtractionWarning,
     TopicPublished,
 )
-from contracts_impact.platform_topics import topic_names
 
 
 def extract(
@@ -19,7 +18,6 @@ def extract(
     schema_names = {s.class_name for s in schemas}
 
     settings_defaults = _load_settings_defaults(repo_root)
-    platform_topics = topic_names()
 
     publishers: list[TopicPublished] = []
     warnings: list[ExtractionWarning] = []
@@ -42,9 +40,7 @@ def extract(
 
         rel = str(py_file.relative_to(repo_root))
         for func, call in _iter_publish_calls(tree):
-            topic, warning = _resolve_topic(
-                call, settings_defaults, platform_topics, rel
-            )
+            topic, warning = _resolve_topic(call, settings_defaults, rel)
             if warning is not None:
                 warnings.append(warning)
             if topic is None:
@@ -97,7 +93,6 @@ def _has_keyword(call: ast.Call, name: str) -> bool:
 def _resolve_topic(
     call: ast.Call,
     settings_defaults: dict[str, str],
-    platform_topics: list[str],
     rel_file: str,
 ) -> tuple[str | None, ExtractionWarning | None]:
     for kw in call.keywords:
@@ -114,14 +109,14 @@ def _resolve_topic(
             default = settings_defaults.get(value.attr)
             if default is not None:
                 return default, None
-            inferred = _infer_topic_from_setting(value.attr, platform_topics)
-            if inferred is not None:
-                return inferred, None
             return None, ExtractionWarning(
                 kind="unresolved_settings_topic",
                 file=rel_file,
                 line=call.lineno,
-                message=f"topic=settings.{value.attr} could not be resolved",
+                message=(
+                    f"topic=settings.{value.attr} could not be resolved — "
+                    "inline a literal at the publish site or add a literal default in app/core/config.py"
+                ),
             )
         return None, ExtractionWarning(
             kind="dynamic_topic",
@@ -130,19 +125,6 @@ def _resolve_topic(
             message=f"topic is a dynamic expression ({ast.dump(value)[:80]})",
         )
     return None, None
-
-
-def _infer_topic_from_setting(setting_name: str, platform_topics: list[str]) -> str | None:
-    """Match `PUBSUB_TOPIC_DEFONTANA_INVOICE` to `defontana.invoice-needed`
-    by tokenizing both and finding the unique platform topic that contains all tokens."""
-    name = setting_name.removeprefix("PUBSUB_TOPIC_")
-    tokens = [t.lower() for t in name.split("_") if t]
-    matches = [
-        t for t in platform_topics if all(tok in t.lower() for tok in tokens)
-    ]
-    if len(matches) == 1:
-        return matches[0]
-    return None
 
 
 def _detect_schema_in_func(

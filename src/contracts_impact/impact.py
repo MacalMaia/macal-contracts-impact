@@ -169,7 +169,7 @@ def topic(topic_name: str, macal_root: Path) -> None:
     """Find publishers and subscribers for a pub/sub topic."""
     all_contracts = load_all_contracts(macal_root)
     publishers: list[tuple[str, str, str | None, int]] = []
-    subscribers: list[tuple[str, str | None, int | None, str | None, str | None]] = []
+    subscribers: list[tuple[str, str | None, int | None]] = []
 
     for svc_name, contracts in all_contracts.items():
         for pub in contracts.provides.topics_published:
@@ -177,9 +177,7 @@ def topic(topic_name: str, macal_root: Path) -> None:
                 publishers.append((svc_name, pub.publisher, pub.event_schema, pub.line))
         for sub in contracts.consumes.topics_subscribed:
             if sub.topic == topic_name:
-                subscribers.append(
-                    (svc_name, sub.handler, sub.line, sub.push_endpoint, sub.dlq)
-                )
+                subscribers.append((svc_name, sub.handler, sub.line))
 
     console.rule(f"[bold]Topic: {topic_name}[/bold]")
 
@@ -196,16 +194,9 @@ def topic(topic_name: str, macal_root: Path) -> None:
     console.print()
     if subscribers:
         console.print(f"[cyan]Subscribers ({len(subscribers)}):[/cyan]")
-        for svc_name, handler, line, push, dlq in subscribers:
+        for svc_name, handler, line in subscribers:
             console.print(f"  • {svc_name}")
-            if handler:
-                console.print(f"    handler: {handler}:{line}")
-            else:
-                console.print("    handler: [red]MISSING (orphan subscription)[/red]")
-            if push:
-                console.print(f"    push_endpoint: {push}")
-            if dlq:
-                console.print(f"    dlq: {dlq}")
+            console.print(f"    handler: {handler}:{line}")
     else:
         console.print("[yellow]Subscribers: 0 found[/yellow]")
 

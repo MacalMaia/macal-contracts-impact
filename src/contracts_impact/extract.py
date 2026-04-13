@@ -48,7 +48,7 @@ def extract_service(service_name: str, repo_root: Path) -> ServiceContracts:
     http_providers, route_warnings = fastapi_routes.extract(repo_root)
     http_consumers, client_warnings = http_clients.extract(repo_root)
     pub_topics, pub_warnings = publishers.extract(repo_root, schemas)
-    sub_topics, sub_warnings = subscribers.extract(repo_root, service_name, http_providers)
+    sub_topics, sub_warnings = subscribers.extract(http_providers)
 
     contracts.provides = Provides(
         http=http_providers,

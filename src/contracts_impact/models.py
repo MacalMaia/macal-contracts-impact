@@ -37,7 +37,7 @@ class TopicSubscribed(BaseModel):
     handler: str | None = None
     line: int | None = None
 
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="forbid")
 
 
 class EventSchemaRef(BaseModel):

@@ -71,7 +71,7 @@ contracts-impact status
 ```bash
 contracts-impact orphans
 ```
-Lists topics declared in `init-pubsub.py` with no handler, or subscribed without a publisher. Catches dead subscriptions before they bite you in production.
+Aggregates `topics_published` across all services and compares to `topics_subscribed`. Reports topics that are published but never subscribed, and topics that are subscribed but never published. Catches dead subscriptions before they bite you in production.
 
 ### Refresh a service's contracts after editing it
 
@@ -134,7 +134,7 @@ consumes:
   http:
     - { target: macal-users-api, method: GET, path: /api/v1/internal/wallets/{user_id}/balance, caller: app/services/macal_users_api_client.py::MacalUsersApiClient.get_balance, line: 107 }
   topics_subscribed:
-    - { topic: wallet.balance-changed, handler: app/api/api_v1/endpoints/events.py::handle_balance_changed, line: 30, push_endpoint: ..., dlq: wallet.balance-changed.dlq }
+    - { topic: wallet.balance-changed, handler: app/api/api_v1/endpoints/events.py::handle_balance_changed, line: 30 }
 ```
 
 The extractor handles:
@@ -143,9 +143,9 @@ The extractor handles:
 - **Generic proxy clients** like `users_api_client.proxy("GET", "/path", ...)`
 - **Same-class wrapper methods** like `cls._post(path, body)`
 - **Pub/Sub publishers** including wrappers like `_publish_defontana_event(topic=..., event_type=...)`
-- **Pub/Sub subscribers** detected via `/events/<topic>` URL patterns and `init-pubsub.py` declarations
+- **Pub/Sub subscribers** detected via `/events/<topic>` URL patterns — the URL last segment IS the canonical topic name
 - **Frontend fetch patterns** in TypeScript/Vue/Next.js/Nuxt: composable wrappers, Next.js route handlers, Nuxt server route singletons
-- **Settings-driven topic names** that can't be resolved at parse time, via fuzzy matching against `init-pubsub.py`
+- **Settings-driven topic names** require a literal default in `app/core/config.py`. If neither a literal at the publish site nor a literal default in config is present, the tool emits an `unresolved_settings_topic` warning — no silent fallback.
 
 ## Limitations
 
@@ -162,7 +162,13 @@ uv sync
 uv run contracts-impact --help
 ```
 
-Tests aren't yet written — the extractors are validated by running them against the live macal repos and comparing counts to known ground truth. See `tests/` for placeholder.
+Tests live under `tests/` and use golden fixture mini-repos at `tests/fixtures/`. Run with:
+
+```bash
+uv run pytest
+```
+
+The critical determinism test is `test_publisher_settings_no_default_emits_warning_not_silent_drop`: it locks in that the tool will never silently drop a publisher when settings indirection can't be resolved.
 
 ## License
 
