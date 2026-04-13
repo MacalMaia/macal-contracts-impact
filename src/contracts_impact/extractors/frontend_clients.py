@@ -13,6 +13,7 @@ Targets are resolved in this order:
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -177,14 +178,16 @@ def extract(
 
 
 def _walk_source_files(repo_root: Path):
-    for path in sorted(repo_root.rglob("*")):
-        if not path.is_file():
-            continue
-        if path.suffix not in SOURCE_EXTS:
-            continue
-        if any(part in SKIP_DIRS for part in path.parts):
-            continue
-        yield path
+    # os.walk avoids pathlib's glob-pattern interpretation of directory names
+    # like Next.js (group) and [param] which Path.rglob mishandles.
+    results: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(repo_root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        for fname in filenames:
+            if Path(fname).suffix not in SOURCE_EXTS:
+                continue
+            results.append(Path(dirpath) / fname)
+    yield from sorted(results)
 
 
 def _scan_local_env_vars(source: str) -> dict[str, str]:
