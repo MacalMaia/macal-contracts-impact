@@ -1,0 +1,27 @@
+[project]
+name = "contracts-impact"
+version = "0.1.0"
+description = "Cross-service impact analysis for the macal platform"
+readme = "README.md"
+authors = [
+    { name = "Camilo Soria", email = "csoria@macal.cl" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "click>=8.1",
+    "pyyaml>=6.0",
+    "rich>=13.7",
+    "pydantic>=2.6",
+]
+
+[project.scripts]
+contracts-impact = "contracts_impact.impact:cli"
+
+[build-system]
+requires = ["uv_build>=0.9.17,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
