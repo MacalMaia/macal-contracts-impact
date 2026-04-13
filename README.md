@@ -23,7 +23,7 @@ GitNexus is great for **within-repo** call graph analysis (rename safety, blast 
 Requires Python 3.12+ and [uv](https://github.com/astral-sh/uv).
 
 ```bash
-uv tool install git+https://github.com/MacalMaia/contracts-impact.git
+uv tool install git+https://github.com/MacalMaia/macal-contracts-impact.git
 ```
 
 The `contracts-impact` CLI is now available globally.
@@ -94,7 +94,7 @@ Each macal repo has a `.github/workflows/contracts-check.yml` that:
 
 This keeps the contracts file honest without depending on developer discipline. If your edit broke the contract, the CI tells you.
 
-If the contracts repo is private, your CI needs a deploy key or a GitHub token with read access to `MacalMaia/contracts-impact`.
+If the contracts repo is private, your CI needs a deploy key or a GitHub token with read access to `MacalMaia/macal-contracts-impact`.
 
 ## Local workflow per repo
 
@@ -156,7 +156,7 @@ The extractor handles:
 ## Development
 
 ```bash
-git clone https://github.com/MacalMaia/contracts-impact.git
+git clone https://github.com/MacalMaia/macal-contracts-impact.git
 cd contracts-impact
 uv sync
 uv run contracts-impact --help

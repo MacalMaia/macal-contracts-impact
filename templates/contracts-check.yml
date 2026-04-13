@@ -1,0 +1,64 @@
+# Per-repo CI check that fails if .contracts.yaml drifts from what the code says.
+#
+# Copy this file to .github/workflows/contracts-check.yml in each macal repo
+# and replace `<SERVICE_NAME>` below with the repo's service name (e.g.
+# auction-engine, macal-users-api, macal-api, payment-gateway,
+# auctioneer-front, macal-maia-front, macal-new-web).
+#
+# If MacalMaia/macal-contracts-impact is private, the workflow needs a deploy key or
+# a fine-grained personal access token with read access stored in a repo secret
+# named CONTRACTS_IMPACT_TOKEN. The job will use HTTPS+token if the secret is
+# set, otherwise it falls back to public HTTPS install.
+
+name: Contracts Check
+
+on:
+  pull_request:
+    branches: [main, master]
+  push:
+    branches: [main, master]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Install Python
+        run: uv python install 3.12
+
+      - name: Install contracts-impact (with token if available)
+        env:
+          GH_TOKEN: ${{ secrets.CONTRACTS_IMPACT_TOKEN }}
+        run: |
+          if [ -n "$GH_TOKEN" ]; then
+            uv tool install "git+https://x-access-token:${GH_TOKEN}@github.com/MacalMaia/macal-contracts-impact.git"
+          else
+            uv tool install "git+https://github.com/MacalMaia/macal-contracts-impact.git"
+          fi
+          contracts-impact --help
+
+      - name: Re-extract contracts
+        run: contracts-impact extract <SERVICE_NAME> --repo-path .
+
+      - name: Fail if .contracts.yaml drifted
+        run: |
+          if ! git diff --quiet -- .contracts.yaml; then
+            echo "::error::.contracts.yaml is out of sync with the code."
+            echo ""
+            echo "Run one of these locally and commit the result:"
+            echo "  make contracts            # Python backends"
+            echo "  pnpm contracts:extract    # TypeScript frontends"
+            echo "  contracts-impact extract <SERVICE_NAME> --repo-path ."
+            echo ""
+            echo "Drift detail:"
+            git --no-pager diff -- .contracts.yaml
+            exit 1
+          fi
+          echo "✓ .contracts.yaml is up to date"
