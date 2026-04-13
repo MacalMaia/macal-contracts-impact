@@ -177,7 +177,7 @@ def extract(
 
 
 def _walk_source_files(repo_root: Path):
-    for path in repo_root.rglob("*"):
+    for path in sorted(repo_root.rglob("*")):
         if not path.is_file():
             continue
         if path.suffix not in SOURCE_EXTS:
