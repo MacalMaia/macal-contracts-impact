@@ -6,13 +6,14 @@ to the backend service that provides them, without hardcoding prefix rules.
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
 from contracts_impact.aggregator import load_all_contracts
 
 PARAM_PATTERN = re.compile(r"\{[^}]+\}")
-DEFAULT_MACAL_ROOT = Path.home() / "macal"
+DEFAULT_MACAL_ROOT = Path(os.environ.get("MACAL_ROOT", Path.home() / "macal")).expanduser()
 
 
 def _normalize(path: str) -> str:

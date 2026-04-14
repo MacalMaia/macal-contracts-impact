@@ -30,7 +30,7 @@ The `contracts-impact` CLI is now available globally.
 
 ## Daily usage
 
-All commands run from your terminal. Some assume your macal repos are cloned under `~/macal/` (the default `--macal-root`).
+All commands run from your terminal. Some assume your macal repos are cloned under a single parent directory. The default is `~/macal/`; override by setting `MACAL_ROOT` in your shell profile or passing `--macal-root`.
 
 ### Find consumers of an endpoint
 

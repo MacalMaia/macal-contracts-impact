@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -16,7 +17,7 @@ from contracts_impact.models import ServiceContracts
 
 console = Console()
 
-DEFAULT_MACAL_ROOT = Path.home() / "macal"
+DEFAULT_MACAL_ROOT = Path(os.environ.get("MACAL_ROOT", Path.home() / "macal")).expanduser()
 
 
 def _macal_root() -> Path:
