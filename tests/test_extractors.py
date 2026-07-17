@@ -62,3 +62,25 @@ def test_http_client_singleton_extraction(fixtures_root: Path) -> None:
     targets_methods = {(c.target, c.method, c.path) for c in consumers}
     assert ("macal-users-api", "GET", "/api/v1/things/{thing_id}") in targets_methods
     assert ("macal-users-api", "POST", "/api/v1/things") in targets_methods
+
+
+def test_frontend_var_template_fetch_extraction(fixtures_root: Path) -> None:
+    from contracts_impact.extractors import frontend_clients
+
+    consumers, warnings = frontend_clients.extract(
+        fixtures_root / "frontend_var_template", "maia-banks"
+    )
+    triples = {(c.method, c.path, c.target) for c in consumers}
+    # GET has no explicit method in its fetch options: the verb must come from
+    # the enclosing handler, NOT from the next fetch call's options.
+    assert ("GET", "/api/v4/things/{param}", "macal-api") in triples
+    assert ("DELETE", "/api/v4/things/{param}", "macal-api") in triples
+    assert ("POST", "/api/v4/things/search", "macal-api") in triples
+    # Query-forwarding proxies: the nested-backtick ternary and the literal
+    # `?${...}` suffix must both collapse to the clean base path.
+    assert ("GET", "/api/v4/things/export", "macal-api") in triples
+    assert ("PUT", "/api/v4/things/export", "macal-api") in triples
+    # No spurious extra rows (malformed template remnants, stolen verbs).
+    assert len(triples) == 5
+    assert all(c.caller.endswith("route.ts::fetch") for c in consumers)
+    assert warnings == []

@@ -123,6 +123,23 @@ TEMPLATE_FETCH_RE = re.compile(
     r"(?:\s*,\s*\{[^{}]*?method:\s*['\"](?P<method>GET|POST|PUT|PATCH|DELETE)['\"])?"
 )
 
+# Pattern 4b (Next.js route handlers): the URL template is assigned to a local
+# const first and fetched by name — ubiquitous in API proxy routes:
+#   const upstreamUrl = `${API_BASE_URL}/api/v4/foo/${id}`
+#   const upstream = await fetch(upstreamUrl, { method: "POST", ... })
+VAR_TEMPLATE_ASSIGN_RE = re.compile(
+    r"\b(?:const|let|var)\s+(?P<var>[A-Za-z_]\w*)\s*=\s*"
+    r"`\$\{(?P<base>[a-zA-Z_][a-zA-Z0-9_.]*)\}(?P<path>/[^`]+)`"
+)
+VAR_FETCH_RE = re.compile(r"\bfetch\s*\(\s*(?P<var>[A-Za-z_]\w*)\s*(?P<delim>[,)])")
+FETCH_CALL_RE = re.compile(r"\bfetch\s*\(")
+FETCH_METHOD_RE = re.compile(
+    r"method:\s*['\"](?P<method>GET|POST|PUT|PATCH|DELETE)['\"]", re.IGNORECASE
+)
+ROUTE_HANDLER_RE = re.compile(
+    r"\bexport\s+(?:(?:async\s+)?function|const)\s+(?P<verb>GET|POST|PUT|PATCH|DELETE)\b"
+)
+
 # Pattern 5 (auctioneer-front composable wrapper internal): apiFetch wrapper definition
 # `const apiFetch = ... fetch(\`${API_BASE_URL}${endpoint}\`, ...)` where API_BASE_URL maps to a service
 # For these, individual apiFetch calls in the same file will be picked up by Pattern 3,
@@ -163,6 +180,9 @@ def extract(
         consumers.extend(_extract_wrapper_request_calls(source, rel))
         consumers.extend(_extract_apifetch_calls(source, rel, local_env_map, path_router))
         consumers.extend(_extract_template_fetch_calls(source, rel, local_env_map, path_router))
+        consumers.extend(
+            _extract_var_template_fetch_calls(source, rel, local_env_map, path_router)
+        )
 
     # Dedupe by (target, method, path, caller)
     seen: set[tuple[str, str, str, str]] = set()
@@ -175,6 +195,83 @@ def extract(
         deduped.append(c)
 
     return deduped, warnings
+
+
+
+
+def _extract_var_template_fetch_calls(
+    source: str,
+    rel: str,
+    local_env: dict[str, str],
+    path_router: PathRouter,
+) -> list[HttpConsumer]:
+    """Pattern 4b: `const url = `${BASE}/path`` assigned first, then fetch(url).
+
+    The verb comes from the fetch options when explicit; otherwise from the
+    enclosing exported route-handler function (GET/POST/...); else DEFAULT_VERB.
+    The reported line points at the URL assignment (where the path lives).
+    """
+    assigns = list(VAR_TEMPLATE_ASSIGN_RE.finditer(source))
+    if not assigns:
+        return []
+    handlers = list(ROUTE_HANDLER_RE.finditer(source))
+    out: list[HttpConsumer] = []
+    for fm in VAR_FETCH_RE.finditer(source):
+        var = fm.group("var")
+        prior = [a for a in assigns if a.group("var") == var and a.start() < fm.start()]
+        if not prior:
+            continue
+        # Nearest preceding assignment wins: per-handler consts reuse the name.
+        assign = prior[-1]
+        # If the var is reassigned between the template assignment and the
+        # fetch (another handler reusing the name, a rebuilt URL), the pairing
+        # is unsafe: skip rather than risk a phantom consumer.
+        between = source[assign.end() : fm.start()]
+        if re.search(rf"\b{re.escape(var)}\s*=", between):
+            continue
+        base = assign.group("base")
+        base_key = base.split(".")[-1]
+        path = _clean_template_path(assign.group("path"))
+        if path is None:
+            continue
+        # Look for an explicit method only within THIS fetch call. No options
+        # object (delimiter is `)`) -> no method to find. Otherwise bound the
+        # window at the next fetch( so a later call's options can't bleed in.
+        method_m = None
+        if fm.group("delim") == ",":
+            next_fetch = FETCH_CALL_RE.search(source, fm.end())
+            window_end = (
+                min(fm.end() + 400, next_fetch.start())
+                if next_fetch
+                else fm.end() + 400
+            )
+            method_m = FETCH_METHOD_RE.search(source, fm.end(), window_end)
+        verb = (
+            method_m.group("method").upper()
+            if method_m
+            else next(
+                (h.group("verb") for h in reversed(handlers) if h.start() < fm.start()),
+                DEFAULT_VERB,
+            )
+        )
+        target = (
+            local_env.get(base)
+            or local_env.get(base_key)
+            or FRONTEND_ENV_TO_SERVICE.get(base_key)
+            or path_router.resolve(verb, path)
+        )
+        if not target:
+            continue
+        out.append(
+            HttpConsumer(
+                target=target,
+                method=verb,  # type: ignore[arg-type]
+                path=path,
+                caller=f"{rel}::fetch",
+                line=_line_of(source, assign.start()),
+            )
+        )
+    return out
 
 
 def _walk_source_files(repo_root: Path):
@@ -222,6 +319,25 @@ def _normalize_path(path: str) -> str:
     if len(out) > 1 and out.endswith("/"):
         out = out[:-1]
     return out
+
+
+
+
+def _clean_template_path(raw: str) -> str | None:
+    """Sanitize a captured URL-template path into a joinable route path.
+
+    Handles the query-forwarding proxy shapes: drops a trailing unclosed
+    `${...` remnant (nested-backtick ternaries stop the capture early), cuts
+    the query string, and rejects anything still carrying template noise.
+    """
+    raw = re.sub(r"\$\{[^}]*$", "", raw)
+    path = _normalize_path(raw).split("?", 1)[0]
+    if len(path) > 1 and path.endswith("/"):
+        path = path[:-1]
+    if not path.startswith("/") or any(c in path for c in "`'\"$ \n"):
+        return None
+    return path if path != "/" else None
+
 
 
 def _extract_singleton_calls(source: str, rel: str) -> list[HttpConsumer]:
@@ -335,7 +451,9 @@ def _extract_template_fetch_calls(
         base = m.group("base")
         # Trim attribute chain: e.g. `process.env.MACAL_API_URL` → key `MACAL_API_URL`
         base_key = base.split(".")[-1]
-        path = _normalize_path(m.group("path"))
+        path = _clean_template_path(m.group("path"))
+        if path is None:
+            continue
         verb = (m.group("method") or DEFAULT_VERB).upper()
         target = (
             local_env.get(base)

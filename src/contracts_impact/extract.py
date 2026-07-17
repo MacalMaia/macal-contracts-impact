@@ -18,6 +18,7 @@ FRONTEND_SERVICES: set[str] = {
     "auctioneer-front",
     "macal-maia-front",
     "macal-new-web",
+    "maia-banks",
 }
 
 

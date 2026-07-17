@@ -310,6 +310,7 @@ def _unindexed_services(
         "macal-maia-front",
         "macal-new-web",
         "macal-users-api",
+        "maia-banks",
         "payment-gateway",
     }
     return sorted(known_services - set(indexed))
