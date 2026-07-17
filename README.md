@@ -6,7 +6,7 @@ Cross-service impact analysis for the macal platform. Answers the question:
 
 It works by extracting a `.contracts.yaml` file in each repo that catalogues every HTTP route and pub/sub topic that service provides and consumes, then aggregating them into a single platform-wide map.
 
-Currently indexes 7 macal services across 4 backends (FastAPI) and 3 frontends (Vue/Vite, Next.js, Nuxt).
+Currently indexes 8 macal services across 4 backends (FastAPI) and 4 frontends (Vue/Vite, Next.js, Nuxt).
 
 ## Why not just rely on GitNexus?
 
