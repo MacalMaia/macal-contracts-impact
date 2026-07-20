@@ -1,9 +1,12 @@
 r"""Extract HTTP consumers from frontend repos (Vue/Vite, Next.js, Nuxt).
 
-Three patterns detected:
+Patterns detected:
 1. Nuxt singleton wrappers: usersApi.get(event, '/path') or remateApiClient.post(event, '/path', body)
 2. Generic request functions: usersApiRequest(event, '/path', { method: 'POST' })
 3. Composable / route-handler fetches: fetch(`${API_BASE_URL}/path`, { method }) and apiFetch('/path', { method })
+4b. Var-assigned templates: `const url = \`${BASE}/path\`` then fetch(url) — the
+    Next.js API-proxy shape, including fetches inside a shared helper that
+    several exported route handlers delegate to.
 
 Targets are resolved in this order:
 - Hardcoded known singleton/wrapper names → service map
@@ -15,6 +18,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import NamedTuple
 
 from contracts_impact.models import ExtractionWarning, HttpConsumer, HttpMethod
 from contracts_impact.path_router import PathRouter
@@ -132,13 +136,34 @@ VAR_TEMPLATE_ASSIGN_RE = re.compile(
     r"`\$\{(?P<base>[a-zA-Z_][a-zA-Z0-9_.]*)\}(?P<path>/[^`]+)`"
 )
 VAR_FETCH_RE = re.compile(r"\bfetch\s*\(\s*(?P<var>[A-Za-z_]\w*)\s*(?P<delim>[,)])")
-FETCH_CALL_RE = re.compile(r"\bfetch\s*\(")
 FETCH_METHOD_RE = re.compile(
     r"method:\s*['\"](?P<method>GET|POST|PUT|PATCH|DELETE)['\"]", re.IGNORECASE
 )
 ROUTE_HANDLER_RE = re.compile(
     r"\bexport\s+(?:(?:async\s+)?function|const)\s+(?P<verb>GET|POST|PUT|PATCH|DELETE)\b"
 )
+
+# Verbs Next.js accepts as an exported route-handler name. Deliberately narrower
+# than the `HTTP_VERBS` of the Python extractors (no head/options, uppercase).
+ROUTE_HANDLER_VERBS: frozenset[str] = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE"})
+
+# Named function declarations, both `function foo()` and `const foo = () =>`,
+# used to find which function a fetch call sits inside.
+FUNCTION_DECL_RE = re.compile(
+    r"\b(?P<exp1>export\s+)?(?:async\s+)?function\s+(?P<name1>\w+)\s*\("
+    r"|\b(?P<exp2>export\s+)?(?:const|let|var)\s+(?P<name2>\w+)\s*=\s*"
+    r"(?:async\s*)?(?:\([^)]*\)|\w+)\s*=>"
+)
+
+# A variable holding a whole query string (`url.search` → "?a=1", or a
+# URLSearchParams serialized). Interpolated as a trailing path segment it is
+# NOT a path param: `/permissions/${search}` is really `/permissions`.
+# `.get(...)` is deliberately excluded — that yields a single value, which
+# genuinely can be a path param.
+QUERY_STRING_VALUE_RE = re.compile(
+    r"\.search\b(?!Params)|searchParams\.toString\(\)|URLSearchParams\([^)]*\)\.toString\(\)"
+)
+VAR_ASSIGN_RHS_RE = re.compile(r"\b(?:const|let|var)\s+(?P<var>\w+)\s*=\s*(?P<rhs>[^\n;]*)")
 
 # Pattern 5 (auctioneer-front composable wrapper internal): apiFetch wrapper definition
 # `const apiFetch = ... fetch(\`${API_BASE_URL}${endpoint}\`, ...)` where API_BASE_URL maps to a service
@@ -175,13 +200,16 @@ def extract(
             continue
         rel = str(src_file.relative_to(repo_root))
         local_env_map = _scan_local_env_vars(source)
+        qs_vars = _query_string_vars(source)
 
         consumers.extend(_extract_singleton_calls(source, rel))
         consumers.extend(_extract_wrapper_request_calls(source, rel))
         consumers.extend(_extract_apifetch_calls(source, rel, local_env_map, path_router))
-        consumers.extend(_extract_template_fetch_calls(source, rel, local_env_map, path_router))
         consumers.extend(
-            _extract_var_template_fetch_calls(source, rel, local_env_map, path_router)
+            _extract_template_fetch_calls(source, rel, local_env_map, path_router, qs_vars)
+        )
+        consumers.extend(
+            _extract_var_template_fetch_calls(source, rel, local_env_map, path_router, qs_vars)
         )
 
     # Dedupe by (target, method, path, caller)
@@ -197,24 +225,25 @@ def extract(
     return deduped, warnings
 
 
-
-
 def _extract_var_template_fetch_calls(
     source: str,
     rel: str,
     local_env: dict[str, str],
     path_router: PathRouter,
+    qs_vars: set[str],
 ) -> list[HttpConsumer]:
     """Pattern 4b: `const url = `${BASE}/path`` assigned first, then fetch(url).
 
     The verb comes from the fetch options when explicit; otherwise from the
-    enclosing exported route-handler function (GET/POST/...); else DEFAULT_VERB.
+    route handler(s) the call serves — the enclosing exported handler, or every
+    handler delegating to the enclosing helper; else DEFAULT_VERB.
     The reported line points at the URL assignment (where the path lives).
     """
     assigns = list(VAR_TEMPLATE_ASSIGN_RE.finditer(source))
     if not assigns:
         return []
     handlers = list(ROUTE_HANDLER_RE.finditer(source))
+    spans = _function_spans(source)
     out: list[HttpConsumer] = []
     for fm in VAR_FETCH_RE.finditer(source):
         var = fm.group("var")
@@ -231,47 +260,137 @@ def _extract_var_template_fetch_calls(
             continue
         base = assign.group("base")
         base_key = base.split(".")[-1]
-        path = _clean_template_path(assign.group("path"))
+        path = _clean_template_path(assign.group("path"), qs_vars)
         if path is None:
             continue
-        # Look for an explicit method only within THIS fetch call. No options
-        # object (delimiter is `)`) -> no method to find. Otherwise bound the
-        # window at the next fetch( so a later call's options can't bleed in.
-        method_m = None
-        if fm.group("delim") == ",":
-            next_fetch = FETCH_CALL_RE.search(source, fm.end())
-            window_end = (
-                min(fm.end() + 400, next_fetch.start())
-                if next_fetch
-                else fm.end() + 400
-            )
-            method_m = FETCH_METHOD_RE.search(source, fm.end(), window_end)
-        verb = (
-            method_m.group("method").upper()
-            if method_m
-            else next(
-                (h.group("verb") for h in reversed(handlers) if h.start() < fm.start()),
-                DEFAULT_VERB,
-            )
+        # An explicit `method:` in THIS call's options object wins. Otherwise
+        # the call serves whichever handler(s) reach it.
+        explicit = (
+            _options_method(source, fm.end()) if fm.group("delim") == "," else None
         )
-        target = (
-            local_env.get(base)
-            or local_env.get(base_key)
-            or FRONTEND_ENV_TO_SERVICE.get(base_key)
-            or path_router.resolve(verb, path)
-        )
-        if not target:
-            continue
-        out.append(
-            HttpConsumer(
-                target=target,
-                method=verb,  # type: ignore[arg-type]
-                path=path,
-                caller=f"{rel}::fetch",
-                line=_line_of(source, assign.start()),
+        verbs = [explicit] if explicit else _verbs_for_fetch(source, fm.start(), spans, handlers)
+        for verb in verbs:
+            target = (
+                local_env.get(base)
+                or local_env.get(base_key)
+                or FRONTEND_ENV_TO_SERVICE.get(base_key)
+                or path_router.resolve(verb, path)
             )
-        )
+            if not target:
+                continue
+            out.append(
+                HttpConsumer(
+                    target=target,
+                    method=verb,  # type: ignore[arg-type]
+                    path=path,
+                    caller=f"{rel}::fetch",
+                    line=_line_of(source, assign.start()),
+                )
+            )
     return out
+
+
+def _balanced_block(source: str, open_pos: int) -> int:
+    """Index of the `}` closing the `{` at `open_pos` (or len-1 if unbalanced)."""
+    depth = 0
+    for j in range(open_pos, len(source)):
+        if source[j] == "{":
+            depth += 1
+        elif source[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return j
+    return len(source) - 1
+
+
+def _options_method(source: str, after_var: int) -> str | None:
+    """Literal `method:` at the TOP level of the fetch options object.
+
+    Scoping to the object — instead of a character window — keeps a `method`
+    field nested in the request payload (`body: JSON.stringify({method: ...})`)
+    from being mistaken for the HTTP verb, and drops the magic window size.
+    Returns None when the options are passed as a variable rather than a literal.
+    """
+    i = after_var
+    while i < len(source) and source[i] in " \t\r\n":
+        i += 1
+    if i >= len(source) or source[i] != "{":
+        return None
+    obj = source[i : _balanced_block(source, i) + 1]
+    for m in FETCH_METHOD_RE.finditer(obj):
+        prefix = obj[: m.start()]
+        if prefix.count("{") - prefix.count("}") == 1:
+            return m.group("method").upper()
+    return None
+
+
+class FunctionSpan(NamedTuple):
+    name: str
+    exported: bool
+    start: int
+    end: int
+
+
+def _function_spans(source: str) -> list[FunctionSpan]:
+    """Body extent of each named function, for locating the fetch's caller."""
+    out: list[FunctionSpan] = []
+    for m in FUNCTION_DECL_RE.finditer(source):
+        name = m.group("name1") or m.group("name2")
+        if not name:
+            continue
+        body = source.find("{", m.end() - 1)
+        if body == -1:
+            continue
+        exported = bool(m.group("exp1") or m.group("exp2"))
+        out.append(FunctionSpan(name, exported, body, _balanced_block(source, body)))
+    return out
+
+
+def _verbs_for_fetch(
+    source: str,
+    pos: int,
+    spans: list[FunctionSpan],
+    handlers: list[re.Match[str]],
+) -> list[str]:
+    """HTTP verbs a fetch at `pos` serves.
+
+    Inside an exported route handler it is that handler's verb. Inside a shared
+    helper it is every exported handler delegating to that helper — the Next.js
+    `async function proxy(req)` shape, where attributing a single verb would
+    silently drop the other handlers' consumers.
+    """
+    enclosing = [s for s in spans if s.start <= pos <= s.end]
+    if enclosing:
+        inner = min(enclosing, key=lambda s: s.end - s.start)
+        if inner.exported and inner.name.upper() in ROUTE_HANDLER_VERBS:
+            return [inner.name.upper()]
+        delegates = re.compile(rf"\b{re.escape(inner.name)}\s*\(")
+        callers = {
+            s.name.upper()
+            for s in spans
+            if s.exported
+            and s.name.upper() in ROUTE_HANDLER_VERBS
+            and delegates.search(source, s.start, s.end)
+        }
+        if callers:
+            return sorted(callers)
+    nearest = next((h.group("verb") for h in reversed(handlers) if h.start() < pos), None)
+    return [nearest] if nearest else [DEFAULT_VERB]
+
+
+def _query_string_vars(source: str) -> set[str]:
+    """Names of local vars that hold a whole query string, not a path segment."""
+    assigns = [
+        (m.group("var"), m.group("rhs").strip()) for m in VAR_ASSIGN_RHS_RE.finditer(source)
+    ]
+    # `const p = new URLSearchParams(); ... const qs = p.toString()`
+    holders = {var for var, rhs in assigns if rhs.startswith("new URLSearchParams")}
+    return {
+        var
+        for var, rhs in assigns
+        if QUERY_STRING_VALUE_RE.search(rhs)
+        or any(rhs.startswith(f"{h}.toString()") for h in holders)
+    }
 
 
 def _walk_source_files(repo_root: Path):
@@ -321,15 +440,19 @@ def _normalize_path(path: str) -> str:
     return out
 
 
-
-
-def _clean_template_path(raw: str) -> str | None:
+def _clean_template_path(raw: str, qs_vars: set[str]) -> str | None:
     """Sanitize a captured URL-template path into a joinable route path.
 
-    Handles the query-forwarding proxy shapes: drops a trailing unclosed
-    `${...` remnant (nested-backtick ternaries stop the capture early), cuts
-    the query string, and rejects anything still carrying template noise.
+    Handles the query-forwarding proxy shapes: drops a trailing interpolation
+    that holds a whole query string (`/permissions/${search}` → `/permissions`,
+    which would otherwise be emitted as `/permissions/{param}` and join against
+    the unrelated `/permissions/{permission_id}` provider), drops a trailing
+    unclosed `${...` remnant (nested-backtick ternaries stop the capture early),
+    cuts the query string, and rejects anything still carrying template noise.
     """
+    trailing = re.search(r"/?\$\{(?P<var>\w+)\}$", raw)
+    if trailing and trailing.group("var") in qs_vars:
+        raw = raw[: trailing.start()]
     raw = re.sub(r"\$\{[^}]*$", "", raw)
     path = _normalize_path(raw).split("?", 1)[0]
     if len(path) > 1 and path.endswith("/"):
@@ -337,7 +460,6 @@ def _clean_template_path(raw: str) -> str | None:
     if not path.startswith("/") or any(c in path for c in "`'\"$ \n"):
         return None
     return path if path != "/" else None
-
 
 
 def _extract_singleton_calls(source: str, rel: str) -> list[HttpConsumer]:
@@ -445,13 +567,14 @@ def _extract_template_fetch_calls(
     rel: str,
     local_env: dict[str, str],
     path_router: PathRouter,
+    qs_vars: set[str],
 ) -> list[HttpConsumer]:
     out: list[HttpConsumer] = []
     for m in TEMPLATE_FETCH_RE.finditer(source):
         base = m.group("base")
         # Trim attribute chain: e.g. `process.env.MACAL_API_URL` → key `MACAL_API_URL`
         base_key = base.split(".")[-1]
-        path = _clean_template_path(m.group("path"))
+        path = _clean_template_path(m.group("path"), qs_vars)
         if path is None:
             continue
         verb = (m.group("method") or DEFAULT_VERB).upper()

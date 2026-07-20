@@ -84,3 +84,29 @@ def test_frontend_var_template_fetch_extraction(fixtures_root: Path) -> None:
     assert len(triples) == 5
     assert all(c.caller.endswith("route.ts::fetch") for c in consumers)
     assert warnings == []
+
+
+def test_frontend_shared_proxy_helper_extraction(fixtures_root: Path) -> None:
+    """Verb attribution when the fetch is not inside the handler that serves it."""
+    from contracts_impact.extractors import frontend_clients
+
+    consumers, warnings = frontend_clients.extract(
+        fixtures_root / "frontend_proxy_helper", "maia-banks"
+    )
+    triples = {(c.method, c.path, c.target) for c in consumers}
+    # The fetch lives in a shared `proxy()` helper delegated to by both GET and
+    # POST: attributing one verb would silently drop the other's consumer.
+    assert ("GET", "/api/v4/permissions", "macal-api") in triples
+    assert ("POST", "/api/v4/permissions", "macal-api") in triples
+    # `${search}` holds a whole query string, so it is not a path param. Emitting
+    # `/api/v4/permissions/{param}` would join against the unrelated
+    # `/api/v4/permissions/{permission_id}` provider and leave the real
+    # `/api/v4/permissions` looking unconsumed.
+    assert not any(p.startswith("/api/v4/permissions/") for _, p, _ in triples)
+    # `method` nested in the JSON payload is a domain field, not the HTTP verb.
+    assert ("POST", "/api/v4/orders", "macal-api") in triples
+    assert not any(m == "DELETE" for m, _, _ in triples)
+    # A top-level `method` counts however far it sits from the call site.
+    assert ("PATCH", "/api/v4/orders/bulk", "macal-api") in triples
+    assert len(triples) == 4
+    assert warnings == []
