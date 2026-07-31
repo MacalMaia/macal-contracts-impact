@@ -39,8 +39,9 @@ def extract(
             continue
 
         rel = str(py_file.relative_to(repo_root))
+        module_consts = _load_module_constants(tree)
         for func, call in _iter_publish_calls(tree):
-            topic, warning = _resolve_topic(call, settings_defaults, rel)
+            topic, warning = _resolve_topic(call, settings_defaults, module_consts, rel)
             if warning is not None:
                 warnings.append(warning)
             if topic is None:
@@ -93,6 +94,7 @@ def _has_keyword(call: ast.Call, name: str) -> bool:
 def _resolve_topic(
     call: ast.Call,
     settings_defaults: dict[str, str],
+    module_consts: dict[str, str],
     rel_file: str,
 ) -> tuple[str | None, ExtractionWarning | None]:
     for kw in call.keywords:
@@ -118,6 +120,8 @@ def _resolve_topic(
                     "inline a literal at the publish site or add a literal default in app/core/config.py"
                 ),
             )
+        if isinstance(value, ast.Name) and value.id in module_consts:
+            return module_consts[value.id], None
         return None, ExtractionWarning(
             kind="dynamic_topic",
             file=rel_file,
@@ -137,6 +141,38 @@ def _detect_schema_in_func(
             if node.func.id in schema_names:
                 return node.func.id
     return None
+
+
+def _load_module_constants(tree: ast.Module) -> dict[str, str]:
+    """Collect module-level `TOPIC = "literal"` string constants.
+
+    Only top-level assignments count — a name bound inside a function or class
+    is not the module constant the publish site refers to. A name rebound at
+    module level to a different literal is ambiguous, so it is dropped rather
+    than resolved to an arbitrary branch.
+    """
+    consts: dict[str, str] = {}
+    ambiguous: set[str] = set()
+
+    for stmt in tree.body:
+        if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+            targets = [stmt.target]
+        elif isinstance(stmt, ast.Assign):
+            targets = [t for t in stmt.targets if isinstance(t, ast.Name)]
+        else:
+            continue
+        if not isinstance(stmt.value, ast.Constant) or not isinstance(
+            stmt.value.value, str
+        ):
+            continue
+        for target in targets:
+            if consts.get(target.id, stmt.value.value) != stmt.value.value:
+                ambiguous.add(target.id)
+            consts[target.id] = stmt.value.value
+
+    for name in ambiguous:
+        consts.pop(name, None)
+    return consts
 
 
 def _load_settings_defaults(repo_root: Path) -> dict[str, str]:

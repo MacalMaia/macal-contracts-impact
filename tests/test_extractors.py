@@ -32,6 +32,28 @@ def test_publisher_settings_no_default_emits_warning_not_silent_drop(fixtures_ro
     assert "PUBSUB_TOPIC_BAR" in warnings[0].message
 
 
+def test_publisher_module_constant_topic_resolved(fixtures_root: Path) -> None:
+    """`TOPIC = "..."` at module level is as literal as inlining it at the call."""
+    pubs, warnings = publishers.extract(fixtures_root / "publisher_module_constant")
+    topics = [p.topic for p in pubs]
+    assert "qux.module-constant" in topics
+    # The function-local name stays unresolved — it is not a module constant.
+    assert "qux.local-shadow" not in topics
+    assert [w.kind for w in warnings] == ["dynamic_topic"]
+
+
+def test_publisher_ambiguous_module_constant_warns_not_guesses(
+    fixtures_root: Path,
+) -> None:
+    """A name rebound to two different literals must not resolve to either."""
+    pubs, warnings = publishers.extract(
+        fixtures_root / "publisher_module_constant_ambiguous"
+    )
+    assert pubs == []
+    assert len(warnings) == 1
+    assert warnings[0].kind == "dynamic_topic"
+
+
 def test_publisher_wrapper_call_extracted(fixtures_root: Path) -> None:
     pubs, warnings = publishers.extract(fixtures_root / "publisher_wrapper")
     topics = [p.topic for p in pubs]
