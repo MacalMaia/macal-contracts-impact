@@ -132,3 +132,171 @@ def test_frontend_shared_proxy_helper_extraction(fixtures_root: Path) -> None:
     assert ("PATCH", "/api/v4/orders/bulk", "macal-api") in triples
     assert len(triples) == 4
     assert warnings == []
+
+
+def test_frontend_cross_file_proxy_helper_extraction(fixtures_root: Path) -> None:
+    """The fetch lives in `src/lib/`, the path and verbs live in the route files.
+
+    Neither file alone carries an edge: the helper has the env var but no path,
+    the route files have the path (in their location) but no env var. Before
+    the cross-file pass this repo yielded zero consumers, silently.
+    """
+    from contracts_impact.extractors import frontend_clients
+
+    consumers, warnings = frontend_clients.extract(
+        fixtures_root / "frontend_cross_file_proxy", "macal-maia-front"
+    )
+    triples = {(c.method, c.path, c.target) for c in consumers}
+    # Optional catch-all `[[...path]]` → one `/**` subtree per exported verb,
+    # declared by `export { forward as GET, forward as POST, forward as DELETE }`.
+    assert ("GET", "/api/v4/executive/**", "macal-api") in triples
+    assert ("POST", "/api/v4/executive/**", "macal-api") in triples
+    assert ("DELETE", "/api/v4/executive/**", "macal-api") in triples
+    # Required catch-all `[...path]`, single exported verb — the file that does
+    # not forward auth is attributed exactly like the one that does.
+    assert ("GET", "/api/v4/external/sii/**", "macal-api") in triples
+    assert not any(m != "GET" for m, p, _ in triples if p.startswith("/api/v4/external"))
+    # A plain dynamic segment keeps the `{param}` form; no `**` is invented.
+    assert ("GET", "/api/v4/entities/{param}", "macal-api") in triples
+    assert ("PATCH", "/api/v4/entities/{param}", "macal-api") in triples
+    assert len(triples) == 6
+    # The caller names the helper, not `fetch`: the fetch is in another file.
+    assert all(c.caller.endswith("route.ts::proxyMacalApi") for c in consumers)
+    assert warnings == []
+
+
+def test_frontend_cross_file_proxy_argument_path(fixtures_root: Path) -> None:
+    """Same cross-file shape, path supplied by the caller instead of the request."""
+    from contracts_impact.extractors import frontend_clients
+
+    consumers, warnings = frontend_clients.extract(
+        fixtures_root / "frontend_cross_file_proxy_arg", "macal-maia-front"
+    )
+    triples = {(c.method, c.path, c.target) for c in consumers}
+    assert ("GET", "/api/v1/admin/purchases/{param}", "macal-users-api") in triples
+    assert ("PATCH", "/api/v1/admin/purchases/{param}", "macal-users-api") in triples
+    # The handler is POST but it passes no `method:`, so the helper's own
+    # `init.method ?? "GET"` is what reaches the backend. Reporting POST here
+    # would invent a call that is not made.
+    assert ("GET", "/api/v1/admin/payment-request-batches", "macal-users-api") in triples
+    # `${path.join("/")}` splices a catch-all back in: N segments, so `**`, not
+    # a `{param}` that would match no provider at all. And `method: req.method`
+    # names no verb, so the exported handlers are what say which verbs travel.
+    assert ("GET", "/api/v1/admin/refunds/**", "macal-users-api") in triples
+    assert ("POST", "/api/v1/admin/refunds/**", "macal-users-api") in triples
+    assert not any(p == "/api/v1/admin/refunds/{param}" for _, p, _ in triples)
+    # The POST above is the refunds catch-all; the batches handler still does
+    # not turn its own POST into an upstream POST.
+    assert not any(
+        m == "POST" and "batches" in p for m, p, _ in triples
+    )
+    assert len(triples) == 5
+    # The DELETE handler computes its path at runtime: warn, do not guess.
+    assert [w.kind for w in warnings] == ["unresolved_proxy_path"]
+    assert "batches/route.ts" in warnings[0].file
+
+
+def test_frontend_cross_file_proxy_ambiguous_helper_warns(fixtures_root: Path) -> None:
+    """Two backends behind one helper: a warning, not a coin flip."""
+    from contracts_impact.extractors import frontend_clients
+
+    consumers, warnings = frontend_clients.extract(
+        fixtures_root / "frontend_cross_file_proxy_ambiguous", "macal-maia-front"
+    )
+    assert consumers == []
+    assert [w.kind for w in warnings] == ["ambiguous_proxy_helper"]
+    assert "macal-api" in warnings[0].message
+    assert "macal-users-api" in warnings[0].message
+
+
+def test_path_router_resolves_catch_all_subtree_consumer(tmp_path: Path) -> None:
+    """`/prefix/**` must reach providers that sit *below* the prefix."""
+    from contracts_impact.path_router import PathRouter
+
+    repo = tmp_path / "provider-svc"
+    repo.mkdir()
+    (repo / ".contracts.yaml").write_text(
+        "service: provider-svc\n"
+        "extractor_version: 0.1.0\n"
+        "provides:\n"
+        "  http:\n"
+        "  - method: GET\n"
+        "    path: /api/v4/executive/cartera/counters\n"
+        "    handler: app/x.py::counters\n"
+        "    line: 1\n"
+        "  topics_published: []\n"
+        "consumes:\n"
+        "  http: []\n"
+        "  topics_subscribed: []\n"
+    )
+    router = PathRouter(macal_root=tmp_path)
+    assert router.resolve("GET", "/api/v4/executive/**") == "provider-svc"
+    # Exact-path resolution is unchanged, and an unrelated subtree still misses.
+    assert router.resolve("GET", "/api/v4/executive/cartera/counters") == "provider-svc"
+    assert router.resolve("GET", "/api/v9/other/**") is None
+
+
+def test_frontend_composable_inner_fetch_is_not_a_cross_file_helper(
+    fixtures_root: Path,
+) -> None:
+    """An exported composable wrapping its own `apiFetch` is not a proxy helper.
+
+    Its path parameter belongs to an inner closure that no other module can
+    import, and pattern 3 already reads the call sites in place. Warning about
+    it would bury the real cross-file misses in noise.
+    """
+    from contracts_impact.extractors import frontend_clients
+
+    consumers, warnings = frontend_clients.extract(
+        fixtures_root / "frontend_composable_inner_fetch", "auctioneer-front"
+    )
+    triples = {(c.method, c.path, c.target) for c in consumers}
+    assert ("GET", "/api/v1/things", "macal-users-api") in triples
+    assert ("POST", "/api/v1/things", "macal-users-api") in triples
+    assert warnings == []
+
+
+def test_frontend_indirect_url_through_builder_and_locals(fixtures_root: Path) -> None:
+    """The URL reaches `fetch` through a builder function and a chain of locals.
+
+    Nothing visible at the fetch call site names a path or an env var, so
+    before the binding resolver these files produced no edge at all — silently,
+    and for the most heavily used proxies in the repo.
+    """
+    from contracts_impact.extractors import frontend_clients
+
+    consumers, warnings = frontend_clients.extract(
+        fixtures_root / "frontend_indirect_url", "macal-maia-front"
+    )
+    triples = {(c.method, c.path, c.target) for c in consumers}
+
+    # `makeUpstreamUrl` → `const upstreamUrl` → `fetch(upstreamUrl)`, and the
+    # rest of the pathname (`subpath`/`suffix`) is N segments, so `**`.
+    assert ("GET", "/api/v4/tasks/**", "macal-api") in triples
+    assert ("POST", "/api/v4/tasks/**", "macal-api") in triples
+    assert ("DELETE", "/api/v4/tasks/**", "macal-api") in triples
+    # The bare prefix is not emitted alongside its own subtree entry.
+    assert not any(p == "/api/v4/tasks" for _, p, _ in triples)
+
+    # The front mounts /api/admin but the backend serves /api/v3: the path
+    # comes from the template chain (`base` → return), NOT from the file's
+    # location, which is what a location-only rule would have gotten wrong.
+    assert ("GET", "/api/v3/**", "macal-api") in triples
+    assert not any(p.startswith("/api/admin") for _, p, _ in triples)
+
+    # Both branches of the ternary are real upstream paths.
+    assert ("GET", "/api/v4/reports/{param}", "macal-api") in triples
+    assert ("GET", "/api/v4/reports", "macal-api") in triples
+    # `url` is redeclared in POST: function scope keeps GET's branches out of
+    # it, and its own out of GET.
+    reports = {
+        (c.method, c.path) for c in consumers if "reports" in c.caller
+    }
+    assert reports == {
+        ("GET", "/api/v4/reports"),
+        ("GET", "/api/v4/reports/{param}"),
+        ("POST", "/api/v4/reports/bulk"),
+    }
+
+    assert len(triples) == 7
+    assert warnings == []

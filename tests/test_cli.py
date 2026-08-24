@@ -163,3 +163,63 @@ def test_endpoint_command_finds_provider_and_consumers(tmp_path: Path) -> None:
     assert "consumer-svc" in result.output
     assert "get_thing" in result.output
     assert "ThingsClient.get" in result.output
+
+
+def test_endpoint_finds_catch_all_consumer_of_the_whole_subtree(tmp_path: Path) -> None:
+    """A `/prefix/**` consumer answers for every endpoint under that prefix.
+
+    A Next.js catch-all proxy forwards the path without naming it, so there is
+    one contract entry for the subtree. If `endpoint` only matched it literally,
+    the 14 routes it stands for would each report zero consumers — the same
+    silent hole the entry exists to close.
+    """
+    macal_root = _make_macal_root(
+        tmp_path,
+        {
+            "provider-svc": (
+                "service: provider-svc\n"
+                "extractor_version: 0.1.0\n"
+                "provides:\n"
+                "  http:\n"
+                "  - method: GET\n"
+                "    path: /api/v4/executive/cartera/counters\n"
+                "    handler: app/api/api_v4/endpoints/executive.py::counters\n"
+                "    line: 30\n"
+                "  topics_published: []\n"
+                "consumes:\n"
+                "  http: []\n"
+                "  topics_subscribed: []\n"
+            ),
+            "front-svc": (
+                "service: front-svc\n"
+                "extractor_version: 0.1.0\n"
+                "provides:\n"
+                "  http: []\n"
+                "  topics_published: []\n"
+                "consumes:\n"
+                "  http:\n"
+                "  - target: provider-svc\n"
+                "    method: GET\n"
+                "    path: /api/v4/executive/**\n"
+                "    caller: src/app/api/v4/executive/[[...path]]/route.ts::proxyMacalApi\n"
+                "    line: 9\n"
+                "  topics_subscribed: []\n"
+            ),
+        },
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["endpoint", "GET /api/v4/executive/cartera/counters", "--macal-root", str(macal_root)],
+    )
+    assert result.exit_code == 0
+    assert "front-svc" in result.output
+    assert "Consumers (1)" in result.output
+
+    # It must not swallow neighbours outside the subtree.
+    other = runner.invoke(
+        cli, ["endpoint", "GET /api/v4/executives-other", "--macal-root", str(macal_root)]
+    )
+    assert other.exit_code == 0
+    assert "Consumers: 0 found" in other.output

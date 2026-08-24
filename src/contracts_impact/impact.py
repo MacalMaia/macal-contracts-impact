@@ -135,7 +135,7 @@ def endpoint(query: str, macal_root: Path) -> None:
             if prov.method == method and normalize_path(prov.path) == norm_query:
                 providers.append((svc_name, contracts, prov.handler, prov.line))
         for cons in contracts.consumes.http:
-            if cons.method == method and normalize_path(cons.path) == norm_query:
+            if cons.method == method and _consumer_covers(cons.path, norm_query):
                 consumers.append((svc_name, contracts, cons.caller, cons.line))
 
     console.rule(f"[bold]{method} {path}[/bold]")
@@ -161,6 +161,22 @@ def endpoint(query: str, macal_root: Path) -> None:
                 f"  ⚠ Not yet indexed: {', '.join(unindexed)}. Cross-service "
                 "callers in these services will be invisible."
             )
+
+
+def _consumer_covers(consumer_path: str, norm_query: str) -> bool:
+    """Whether a consumer entry claims the queried endpoint.
+
+    Exact match, plus the `/prefix/**` form the frontend extractor emits for a
+    Next.js catch-all route: one entry standing for every backend endpoint in
+    that subtree, because the proxy forwards the path without ever naming it.
+    """
+    consumer = normalize_path(consumer_path)
+    if consumer == norm_query:
+        return True
+    if consumer.endswith("/**"):
+        prefix = consumer[: -len("/**")]
+        return norm_query == prefix or norm_query.startswith(prefix + "/")
+    return False
 
 
 @cli.command()
