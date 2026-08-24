@@ -4,9 +4,14 @@ Patterns detected:
 1. Nuxt singleton wrappers: usersApi.get(event, '/path') or remateApiClient.post(event, '/path', body)
 2. Generic request functions: usersApiRequest(event, '/path', { method: 'POST' })
 3. Composable / route-handler fetches: fetch(`${API_BASE_URL}/path`, { method }) and apiFetch('/path', { method })
-4b. Var-assigned templates: `const url = \`${BASE}/path\`` then fetch(url) — the
-    Next.js API-proxy shape, including fetches inside a shared helper that
-    several exported route handlers delegate to.
+4b. Indirect URLs: the URL never appears inside the `fetch(...)` call. It is
+    resolved through the file's local bindings — `const url = \`${BASE}/path\``
+    then `fetch(url)`, a chain of them (`const base = \`${BASE}/api/v3\``;
+    `const url = \`${base}/${subpath}\``), or a builder function the fetch calls
+    (`fetch(makeUpstreamUrl(request))`). Includes fetches inside a shared helper
+    that several exported route handlers delegate to. A local holding the rest
+    of the incoming pathname (`pathname.replace(/^\/api\/v4\/tasks\//, "")`) is N
+    segments, so it yields the same `/**` subtree suffix as a catch-all route.
 5. Cross-file proxy helpers: the fetch lives in an exported helper in ANOTHER
    module (`src/lib/*-proxy.ts`) that route handlers import and delegate to.
    Two shapes, told apart by where the upstream path comes from:
@@ -140,15 +145,38 @@ TEMPLATE_FETCH_RE = re.compile(
     r"(?:\s*,\s*\{[^{}]*?method:\s*['\"](?P<method>GET|POST|PUT|PATCH|DELETE)['\"])?"
 )
 
-# Pattern 4b (Next.js route handlers): the URL template is assigned to a local
-# const first and fetched by name — ubiquitous in API proxy routes:
+# Pattern 4b (Next.js route handlers): the URL never appears inside the
+# `fetch(...)` call — it reaches it through one or more local bindings, from
+# the shallow
 #   const upstreamUrl = `${API_BASE_URL}/api/v4/foo/${id}`
 #   const upstream = await fetch(upstreamUrl, { method: "POST", ... })
-VAR_TEMPLATE_ASSIGN_RE = re.compile(
-    r"\b(?:const|let|var)\s+(?P<var>[A-Za-z_]\w*)\s*=\s*"
-    r"`\$\{(?P<base>[a-zA-Z_][a-zA-Z0-9_.]*)\}(?P<path>/[^`]+)`"
+# to a builder function the fetch calls:
+#   function makeUpstreamUrl(request) { return `${API_BASE_URL}/api/v4/tasks${suffix}${search}` }
+#   const response = await fetch(makeUpstreamUrl(request), init)
+# The fetch argument is therefore a name, or a call of one.
+INDIRECT_FETCH_RE = re.compile(
+    r"\bfetch\s*\(\s*(?P<expr>[A-Za-z_$][\w$]*(?:\s*\([^()]*\))?)\s*(?P<delim>[,)])"
 )
-VAR_FETCH_RE = re.compile(r"\bfetch\s*\(\s*(?P<var>[A-Za-z_]\w*)\s*(?P<delim>[,)])")
+# What a template literal is bound to, read backwards from the opening backtick.
+# `mid` absorbs the head of a ternary (`return subpath ? \`…\` : \`…\``), so both
+# branches bind to the same name.
+TEMPLATE_RETURN_BINDING_RE = re.compile(r"\breturn\s+(?P<mid>[^`;{}]{0,160})$")
+TEMPLATE_ASSIGN_BINDING_RE = re.compile(
+    r"(?:(?:const|let|var)\s+(?P<decl>[\w$]+)|(?P<assign>[\w$]+))\s*=\s*"
+    r"(?P<mid>[^`=;{}]{0,160})$"
+)
+# `const upstreamUrl = makeUpstreamUrl(request)` — the URL passes through a
+# plain local before reaching the fetch. Recorded as a one-piece template so
+# the same resolver walks it: an alias IS an interpolation of another name.
+ALIAS_BINDING_RE = re.compile(
+    r"\b(?:const|let|var)\s+(?P<var>[\w$]+)\s*=\s*(?:await\s+)?"
+    r"(?P<src>[A-Za-z_$][\w$]*)\s*[(;\n]"
+)
+# A local holding the REST of the incoming pathname (`pathname.replace(...)`),
+# which is N segments, not one: it is the `**` subtree suffix.
+PATHNAME_DERIVED_RE = re.compile(r"\bpathname\b")
+# What separates the two arms of a ternary whose branches are both templates.
+TERNARY_BRANCH_RE = re.compile(r"\s*[?:]\s*")
 FETCH_METHOD_RE = re.compile(
     r"method:\s*['\"](?P<method>GET|POST|PUT|PATCH|DELETE)['\"]", re.IGNORECASE
 )
@@ -215,6 +243,10 @@ JOINED_SEGMENTS_RE = re.compile(r"/?\$\{[^}]*\.join\s*\(")
 QUERY_STRING_VALUE_RE = re.compile(
     r"\.search\b(?!Params)|searchParams\.toString\(\)|URLSearchParams\([^)]*\)\.toString\(\)"
 )
+# An interpolation that builds the query string itself rather than naming a
+# variable holding it: `qp.toString() ? `?${qp.toString()}` : ""`. The literal
+# `?` inside is the tell — a path segment never starts with one.
+QUERY_LITERAL_RE = re.compile(r"[`'\"]\?")
 VAR_ASSIGN_RHS_RE = re.compile(r"\b(?:const|let|var)\s+(?P<var>\w+)\s*=\s*(?P<rhs>[^\n;]*)")
 
 # Pattern 5 (auctioneer-front composable wrapper internal): apiFetch wrapper definition
@@ -269,7 +301,7 @@ def extract(
             _extract_template_fetch_calls(source, rel, local_env_map, path_router, qs_vars)
         )
         consumers.extend(
-            _extract_var_template_fetch_calls(source, rel, local_env_map, path_router, qs_vars)
+            _extract_indirect_fetch_calls(source, rel, local_env_map, path_router, qs_vars)
         )
         proxy_consumers, proxy_warnings = _extract_proxy_helper_calls(
             source, rel, proxy_helpers, qs_vars
@@ -290,69 +322,259 @@ def extract(
     return deduped, warnings
 
 
-def _extract_var_template_fetch_calls(
+class UrlBinding(NamedTuple):
+    """A name that resolves to a URL template somewhere in the file."""
+
+    name: str
+    pieces: tuple[tuple[str, str], ...]
+    pos: int
+    # Visibility: a `const` is only in scope inside its function, while a
+    # function's return value is reachable wherever the function is.
+    scope: tuple[int, int]
+    hoisted: bool
+
+
+def _url_bindings(source: str, spans: list[FunctionSpan]) -> dict[str, list[UrlBinding]]:
+    r"""Names → the URL templates they can hold.
+
+    Covers the two ways a route file hands a URL to `fetch` without inlining
+    it: assignment (`const base = \`${API}/api/v3\``, then
+    `const url = \`${base}/${subpath}\``) and a builder function
+    (`function makeUpstreamUrl(req) { return \`${API}/api/v4/tasks${suffix}\` }`).
+    Both branches of a ternary bind to the same name, so an `if`/`?:` over two
+    upstream shapes yields two bindings rather than one arbitrary winner.
+    """
+    out: dict[str, list[UrlBinding]] = {}
+    comments = _comment_spans(source)
+    previous: tuple[str, tuple[int, int], bool, int] | None = None
+    for offset, end, pieces in _iter_template_literals(source):
+        if any(lo <= offset < hi for lo, hi in comments):
+            continue
+        prefix = source[max(0, offset - 200) : offset]
+        enclosing = [sp for sp in spans if sp.start <= offset <= sp.end]
+        inner = min(enclosing, key=lambda sp: sp.end - sp.start) if enclosing else None
+        ret = TEMPLATE_RETURN_BINDING_RE.search(prefix)
+        sibling = previous and TERNARY_BRANCH_RE.fullmatch(source[previous[3] : offset])
+        if sibling:
+            # `x ? `…` : `…`` — the second branch's prefix contains the first
+            # branch's backticks, which no backward scan can look past. Both
+            # arms bind to the same name.
+            name, scope, hoisted, _ = previous
+        elif ret and inner is not None:
+            name, scope, hoisted = inner.name, (0, len(source)), True
+        else:
+            assign = TEMPLATE_ASSIGN_BINDING_RE.search(prefix)
+            if not assign:
+                previous = None
+                continue
+            name = assign.group("decl") or assign.group("assign")
+            scope = (inner.start, inner.end) if inner else (0, len(source))
+            hoisted = False
+        previous = (name, scope, hoisted, end)
+        out.setdefault(name, []).append(
+            UrlBinding(name, tuple(pieces), offset, scope, hoisted)
+        )
+
+    for m in ALIAS_BINDING_RE.finditer(source):
+        if any(lo <= m.start() < hi for lo, hi in comments):
+            continue
+        enclosing = [sp for sp in spans if sp.start <= m.start() <= sp.end]
+        inner = min(enclosing, key=lambda sp: sp.end - sp.start) if enclosing else None
+        scope = (inner.start, inner.end) if inner else (0, len(source))
+        out.setdefault(m.group("var"), []).append(
+            UrlBinding(
+                m.group("var"), (("expr", m.group("src")),), m.start(), scope, False
+            )
+        )
+    return out
+
+
+def _visible_bindings(
+    bindings: dict[str, list[UrlBinding]], name: str, pos: int
+) -> list[UrlBinding]:
+    """Bindings of `name` that a fetch at `pos` can actually be holding.
+
+    Scoping by the enclosing function is what keeps two handlers that reuse the
+    name `url` from borrowing each other's path — the reason the older pattern
+    had to bail out whenever it saw a reassignment.
+    """
+    return [
+        b
+        for b in bindings.get(name, ())
+        if b.scope[0] <= pos <= b.scope[1] and (b.hoisted or b.pos < pos)
+    ]
+
+
+def _resolve_url_pieces(
+    pieces: tuple[tuple[str, str], ...],
+    pos: int,
+    bindings: dict[str, list[UrlBinding]],
+    local_env: dict[str, str],
+    seen: frozenset[str],
+    depth: int = 0,
+) -> list[tuple[str, tuple[tuple[str, str], ...], int]]:
+    """(service, URL pieces after the base, position of the path template).
+
+    The head is either the env-var base itself, ending the recursion, or
+    another binding to follow, whose own pieces are spliced in front of these.
+    The position reported is that of the template holding the path, which after
+    a chain of indirections is not where the fetch is. `seen` breaks reference
+    cycles; `depth` bounds how far a chain of indirections is worth chasing.
+    """
+    if depth > 4 or not pieces or pieces[0][0] != "expr":
+        return []
+    head = pieces[0][1].strip()
+    tail = tuple(pieces[1:])
+    target = _resolve_base_service(head, local_env)
+    if target:
+        return [(target, tail, pos)]
+    name = head.split("(")[0].strip()
+    if name in seen:
+        return []
+    out: list[tuple[str, tuple[tuple[str, str], ...], int]] = []
+    for b in _visible_bindings(bindings, name, pos):
+        for svc, prefix, origin in _resolve_url_pieces(
+            b.pieces, b.pos, bindings, local_env, seen | {name}, depth + 1
+        ):
+            out.append((svc, prefix + tail, origin))
+    return out[:8]
+
+
+def _subtree_vars(source: str) -> set[str]:
+    r"""Locals holding the REST of the incoming pathname, not a single segment.
+
+    `const subpath = pathname.replace(/^\/api\/v4\/tasks\//, "")` and the
+    `const suffix = subpath ? \`/${subpath}\` : ""` built from it both stand for
+    an arbitrary number of segments, which is `**` and not `{param}`.
+    """
+    assigns = [
+        (m.group("var"), m.group("rhs")) for m in VAR_ASSIGN_RHS_RE.finditer(source)
+    ]
+    out = {var for var, rhs in assigns if PATHNAME_DERIVED_RE.search(rhs)}
+    for _ in range(3):  # transitive closure, in practice one or two hops
+        grown = out | {
+            var
+            for var, rhs in assigns
+            if any(re.search(rf"\b{re.escape(s)}\b", rhs) for s in out)
+        }
+        if grown == out:
+            break
+        out = grown
+    return out
+
+
+def _path_from_pieces(
+    pieces: tuple[tuple[str, str], ...], qs_vars: set[str], subtree_vars: set[str]
+) -> str | None:
+    """Turn resolved URL pieces into a route path.
+
+    Each interpolation is one of three things, and conflating them is what made
+    the old text-level cleanup fragile: a subtree (swallows the rest of the
+    path — the concrete children live in the backend), a query string (ends the
+    path), or a single dynamic segment (`{param}`).
+    """
+    text = ""
+    for kind, value in pieces:
+        if kind == "lit":
+            text += value
+            continue
+        expr = value.strip()
+        base = expr.split(".")[0].split("(")[0].strip()
+        if base in subtree_vars or REQUEST_PATHNAME_RE.match(expr) or ".join(" in expr:
+            head = _clean_template_path(text.rstrip("/"), qs_vars)
+            return f"{head}/**" if head else None
+        if (
+            base in qs_vars
+            or QUERYISH_EXPR_RE.search(expr)
+            or QUERY_LITERAL_RE.search(expr)
+            or QUERY_STRING_VALUE_RE.search(expr)
+        ):
+            break
+        text += "{param}"
+    return _clean_template_path(text, qs_vars)
+
+
+def _extract_indirect_fetch_calls(
     source: str,
     rel: str,
     local_env: dict[str, str],
     path_router: PathRouter,
     qs_vars: set[str],
 ) -> list[HttpConsumer]:
-    """Pattern 4b: `const url = `${BASE}/path`` assigned first, then fetch(url).
+    r"""Pattern 4b/6: the URL is built elsewhere in the file and fetched by name.
+
+    `const url = \`${BASE}/path\`` then `fetch(url)` is the shallow case; the
+    same machinery follows `fetch(makeUpstreamUrl(request))` through the
+    builder function and the chain of locals inside it.
 
     The verb comes from the fetch options when explicit; otherwise from the
     route handler(s) the call serves — the enclosing exported handler, or every
-    handler delegating to the enclosing helper; else DEFAULT_VERB.
-    The reported line points at the URL assignment (where the path lives).
+    handler delegating to the enclosing helper; else DEFAULT_VERB. The reported
+    line points at the template that carries the path.
     """
-    assigns = list(VAR_TEMPLATE_ASSIGN_RE.finditer(source))
-    if not assigns:
+    if "fetch(" not in source:
+        return []
+    spans = _function_spans(source)
+    bindings = _url_bindings(source, spans)
+    if not bindings:
         return []
     handlers = list(ROUTE_HANDLER_RE.finditer(source))
-    spans = _function_spans(source)
+    aliases = _exported_verb_aliases(source)
+    subtree = _subtree_vars(source)
     out: list[HttpConsumer] = []
-    for fm in VAR_FETCH_RE.finditer(source):
-        var = fm.group("var")
-        prior = [a for a in assigns if a.group("var") == var and a.start() < fm.start()]
-        if not prior:
-            continue
-        # Nearest preceding assignment wins: per-handler consts reuse the name.
-        assign = prior[-1]
-        # If the var is reassigned between the template assignment and the
-        # fetch (another handler reusing the name, a rebuilt URL), the pairing
-        # is unsafe: skip rather than risk a phantom consumer.
-        between = source[assign.end() : fm.start()]
-        if re.search(rf"\b{re.escape(var)}\s*=", between):
-            continue
-        base = assign.group("base")
-        base_key = base.split(".")[-1]
-        path = _clean_template_path(assign.group("path"), qs_vars)
-        if path is None:
+    for fm in INDIRECT_FETCH_RE.finditer(source):
+        name = fm.group("expr").split("(")[0].strip()
+        resolved: list[tuple[str, tuple[tuple[str, str], ...], int]] = []
+        for b in _visible_bindings(bindings, name, fm.start()):
+            resolved.extend(
+                _resolve_url_pieces(
+                    b.pieces, b.pos, bindings, local_env, frozenset({name})
+                )
+            )
+        if not resolved:
             continue
         # An explicit `method:` in THIS call's options object wins. Otherwise
         # the call serves whichever handler(s) reach it.
-        explicit = (
-            _options_method(source, fm.end()) if fm.group("delim") == "," else None
+        explicit = _options_method(source, fm.end()) if fm.group("delim") == "," else None
+        verbs = (
+            [explicit]
+            if explicit
+            else _verbs_for_fetch(source, fm.start(), spans, handlers, aliases)
         )
-        verbs = [explicit] if explicit else _verbs_for_fetch(source, fm.start(), spans, handlers)
-        for verb in verbs:
-            target = (
-                local_env.get(base)
-                or local_env.get(base_key)
-                or FRONTEND_ENV_TO_SERVICE.get(base_key)
-                or path_router.resolve(verb, path)
-            )
-            if not target:
+        for target, tail, origin in resolved:
+            path = _path_from_pieces(tail, qs_vars, subtree)
+            if path is None:
                 continue
-            out.append(
-                HttpConsumer(
-                    target=target,
-                    method=verb,  # type: ignore[arg-type]
-                    path=path,
-                    caller=f"{rel}::fetch",
-                    line=_line_of(source, assign.start()),
+            for verb in verbs:
+                out.append(
+                    HttpConsumer(
+                        target=target or path_router.resolve(verb, path),
+                        method=verb,  # type: ignore[arg-type]
+                        path=path,
+                        caller=f"{rel}::fetch",
+                        line=_line_of(source, origin),
+                    )
                 )
-            )
-    return out
+    return _drop_paths_covered_by_subtree(out)
+
+
+def _drop_paths_covered_by_subtree(consumers: list[HttpConsumer]) -> list[HttpConsumer]:
+    r"""Remove `/x` when the same caller already claims `/x/**`.
+
+    A proxy with a `subpath ? \`${base}/${subpath}\` : \`${base}\`` ternary
+    resolves to both; the subtree entry already answers for the bare prefix.
+    """
+    subtrees = {
+        (c.target, c.method, c.caller, c.path[: -len("/**")])
+        for c in consumers
+        if c.path.endswith("/**")
+    }
+    return [
+        c
+        for c in consumers
+        if c.path.endswith("/**")
+        or (c.target, c.method, c.caller, c.path) not in subtrees
+    ]
 
 
 def _balanced_block(source: str, open_pos: int) -> int:
@@ -584,7 +806,9 @@ def _query_string_vars(source: str) -> set[str]:
     ]
     # `const p = new URLSearchParams(); ... const qs = p.toString()`
     holders = {var for var, rhs in assigns if rhs.startswith("new URLSearchParams")}
-    return {
+    # The holder itself counts: interpolating it, or its `.toString()`, yields
+    # the query string, never a path segment.
+    return holders | {
         var
         for var, rhs in assigns
         if QUERY_STRING_VALUE_RE.search(rhs)
@@ -823,7 +1047,7 @@ class ProxyHelper(NamedTuple):
 
 
 def _iter_template_literals(text: str):
-    """Yield (offset, pieces) for each top-level template literal in `text`.
+    """Yield (start, end, pieces) for each top-level template literal in `text`.
 
     `pieces` is a list of ("lit"|"expr", content). Nested templates inside an
     interpolation are consumed as part of their expression, so a query-string
@@ -875,7 +1099,7 @@ def _iter_template_literals(text: str):
             pieces.append(("lit", buf))
             # Empty literals are scan artifacts (`${a}${b}` has one between the
             # interpolations, and one before the first): they carry no path.
-            yield i, [(kind, text) for kind, text in pieces if kind == "expr" or text]
+            yield i, j, [(kind, text) for kind, text in pieces if kind == "expr" or text]
         i = j if j > i else i + 1
 
 
@@ -981,7 +1205,7 @@ def _index_proxy_helpers(
         comments = _comment_spans(source)
         # Group the `${SERVICE_URL}…` templates by the function that owns them.
         owned: dict[FunctionSpan, list[tuple[int, list[tuple[str, str]], str]]] = {}
-        for offset, pieces in _iter_template_literals(source):
+        for offset, _end, pieces in _iter_template_literals(source):
             if len(pieces) < 2 or pieces[0][0] != "expr":
                 continue
             if any(lo <= offset < hi for lo, hi in comments):

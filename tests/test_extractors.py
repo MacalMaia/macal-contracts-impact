@@ -254,3 +254,49 @@ def test_frontend_composable_inner_fetch_is_not_a_cross_file_helper(
     assert ("GET", "/api/v1/things", "macal-users-api") in triples
     assert ("POST", "/api/v1/things", "macal-users-api") in triples
     assert warnings == []
+
+
+def test_frontend_indirect_url_through_builder_and_locals(fixtures_root: Path) -> None:
+    """The URL reaches `fetch` through a builder function and a chain of locals.
+
+    Nothing visible at the fetch call site names a path or an env var, so
+    before the binding resolver these files produced no edge at all — silently,
+    and for the most heavily used proxies in the repo.
+    """
+    from contracts_impact.extractors import frontend_clients
+
+    consumers, warnings = frontend_clients.extract(
+        fixtures_root / "frontend_indirect_url", "macal-maia-front"
+    )
+    triples = {(c.method, c.path, c.target) for c in consumers}
+
+    # `makeUpstreamUrl` → `const upstreamUrl` → `fetch(upstreamUrl)`, and the
+    # rest of the pathname (`subpath`/`suffix`) is N segments, so `**`.
+    assert ("GET", "/api/v4/tasks/**", "macal-api") in triples
+    assert ("POST", "/api/v4/tasks/**", "macal-api") in triples
+    assert ("DELETE", "/api/v4/tasks/**", "macal-api") in triples
+    # The bare prefix is not emitted alongside its own subtree entry.
+    assert not any(p == "/api/v4/tasks" for _, p, _ in triples)
+
+    # The front mounts /api/admin but the backend serves /api/v3: the path
+    # comes from the template chain (`base` → return), NOT from the file's
+    # location, which is what a location-only rule would have gotten wrong.
+    assert ("GET", "/api/v3/**", "macal-api") in triples
+    assert not any(p.startswith("/api/admin") for _, p, _ in triples)
+
+    # Both branches of the ternary are real upstream paths.
+    assert ("GET", "/api/v4/reports/{param}", "macal-api") in triples
+    assert ("GET", "/api/v4/reports", "macal-api") in triples
+    # `url` is redeclared in POST: function scope keeps GET's branches out of
+    # it, and its own out of GET.
+    reports = {
+        (c.method, c.path) for c in consumers if "reports" in c.caller
+    }
+    assert reports == {
+        ("GET", "/api/v4/reports"),
+        ("GET", "/api/v4/reports/{param}"),
+        ("POST", "/api/v4/reports/bulk"),
+    }
+
+    assert len(triples) == 7
+    assert warnings == []
