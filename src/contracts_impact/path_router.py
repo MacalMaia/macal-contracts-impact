@@ -41,14 +41,22 @@ class PathRouter:
                 self._routes.append((segs, prov.method, service))
 
     def resolve(self, method: str, path: str) -> str | None:
-        query_segs = _normalize(path).strip("/").split("/")
-        if not query_segs or query_segs == [""]:
+        """Service behind `path`, which may be a `/prefix/**` subtree consumer.
+
+        A `**` suffix (a Next.js catch-all route forwarding a whole subtree)
+        makes the query open-ended: providers *below* the prefix match it too,
+        which a plain segment-prefix test would reject for being too long.
+        """
+        normalized = _normalize(path)
+        open_ended = normalized.rstrip("/").endswith("**")
+        query_segs = [s for s in normalized.strip("/").split("/") if s != "**"]
+        if not query_segs:
             return None
 
         best_score = -1
         best_service: str | None = None
         for prov_segs, prov_method, service in self._routes:
-            score = _match_segments(query_segs, prov_segs)
+            score = _match_segments(query_segs, prov_segs, open_ended)
             if score is None:
                 continue
             # Prefer same-method matches (+1000 bonus), then longest match
@@ -59,15 +67,18 @@ class PathRouter:
         return best_service
 
 
-def _match_segments(query: list[str], prov: list[str]) -> int | None:
-    """Return the number of matched segments if `prov` is a segment-prefix of `query`,
+def _match_segments(query: list[str], prov: list[str], open_ended: bool = False) -> int | None:
+    """Number of matched segments if `prov` is a segment-prefix of `query`,
     treating `{param}` as a wildcard. Otherwise None.
+
+    With `open_ended`, `query` is itself a prefix (a `/**` subtree), so a longer
+    provider still matches on the segments the two share.
     """
-    if len(prov) > len(query):
+    if len(prov) > len(query) and not open_ended:
         return None
     for q, p in zip(prov, query, strict=False):
         if q == "{param}":
             continue
         if q != p:
             return None
-    return len(prov)
+    return min(len(prov), len(query))
