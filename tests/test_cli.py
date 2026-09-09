@@ -2,7 +2,7 @@ from pathlib import Path
 
 from click.testing import CliRunner
 
-from contracts_impact.impact import cli
+from contracts_impact.impact import _discover_services, cli
 
 
 def _make_macal_root(tmp_path: Path, contracts: dict[str, str]) -> Path:
@@ -223,3 +223,125 @@ def test_endpoint_finds_catch_all_consumer_of_the_whole_subtree(tmp_path: Path) 
     )
     assert other.exit_code == 0
     assert "Consumers: 0 found" in other.output
+
+
+_FRONT_YAML = (
+    "service: macal-maia-front\n"
+    "extractor_version: 0.1.0\n"
+    "provides:\n"
+    "  http: []\n"
+    "  topics_published: []\n"
+    "consumes:\n"
+    "  http:\n"
+    "  - target: macal-api\n"
+    "    method: POST\n"
+    "    path: /api/v4/auctions/{param}/entities/reorder\n"
+    "    caller: src/app/api/v4/auctions/[id]/entities/reorder/route.ts::fetch\n"
+    "    line: 23\n"
+    "  topics_subscribed: []\n"
+)
+
+_STALE_WORKTREE_YAML = (
+    "service: macal-maia-front\n"
+    "extractor_version: 0.1.0\n"
+    "provides:\n"
+    "  http: []\n"
+    "  topics_published: []\n"
+    "consumes:\n"
+    "  http: []\n"
+    "  topics_subscribed: []\n"
+)
+
+
+def test_endpoint_prefers_the_repo_over_a_worktree_indexing_the_same_service(
+    tmp_path: Path,
+) -> None:
+    """Locks in the bug where a git worktree parked next to its repo shadowed it.
+
+    Both directories declare `service: macal-maia-front`, and the loader keyed by
+    service name, so the worktree's stale (and here empty) index silently won and
+    every consumer in the real repo reported as 0.
+    """
+    macal_root = _make_macal_root(
+        tmp_path,
+        {
+            "macal-maia-front": _FRONT_YAML,
+            # Sorts after the repo, so last-write-wins used to pick this one.
+            "macal-maia-front-liquidacion-uf-snapshot": _STALE_WORKTREE_YAML,
+        },
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "endpoint",
+            "POST /api/v4/auctions/{auction_id}/entities/reorder",
+            "--macal-root",
+            str(macal_root),
+        ],
+    )
+
+    assert result.exit_code == 0, f"crashed with: {result.output}"
+    assert "Consumers (1)" in result.output
+    assert "0 found in indexed services" not in result.output
+    # The shadowed copy is announced, not silently dropped.
+    assert "macal-maia-front-liquidacion-uf-snapshot" in result.output
+
+
+def test_endpoint_keeps_nextjs_dynamic_segments_in_caller_paths(tmp_path: Path) -> None:
+    """`[id]` is valid rich markup, so unescaped caller paths printed without it."""
+    macal_root = _make_macal_root(tmp_path, {"macal-maia-front": _FRONT_YAML})
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "endpoint",
+            "POST /api/v4/auctions/{auction_id}/entities/reorder",
+            "--macal-root",
+            str(macal_root),
+        ],
+    )
+
+    assert result.exit_code == 0, f"crashed with: {result.output}"
+    assert "auctions/[id]/entities/reorder" in result.output.replace("\n", "")
+
+
+def test_a_worktree_without_a_canonical_repo_still_answers(tmp_path: Path) -> None:
+    """No directory matches the service name: keep the first, report the rest."""
+    macal_root = _make_macal_root(
+        tmp_path,
+        {
+            "front-worktree-a": _FRONT_YAML,
+            "front-worktree-b": _STALE_WORKTREE_YAML,
+        },
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "endpoint",
+            "POST /api/v4/auctions/{auction_id}/entities/reorder",
+            "--macal-root",
+            str(macal_root),
+        ],
+    )
+
+    assert result.exit_code == 0, f"crashed with: {result.output}"
+    assert "Consumers (1)" in result.output
+    assert "front-worktree-b" in result.output
+
+
+def test_discover_services_skips_worktrees_declaring_another_service(tmp_path: Path) -> None:
+    """`extract` with no argument must not mint a service per worktree directory."""
+    macal_root = _make_macal_root(
+        tmp_path,
+        {
+            "macal-maia-front": _FRONT_YAML,
+            "macal-maia-front-liquidacion-uf-snapshot": _STALE_WORKTREE_YAML,
+        },
+    )
+
+    assert _discover_services(macal_root) == ["macal-maia-front"]

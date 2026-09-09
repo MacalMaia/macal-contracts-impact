@@ -8,9 +8,10 @@ from pathlib import Path
 
 import click
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
-from contracts_impact.aggregator import load_all_contracts, load_one, write_one
+from contracts_impact.aggregator import load_index, load_one, write_one
 from contracts_impact.extract import extract_service
 from contracts_impact.extractors.http_clients import normalize_path
 from contracts_impact.models import ServiceContracts
@@ -22,6 +23,25 @@ DEFAULT_MACAL_ROOT = Path(os.environ.get("MACAL_ROOT", Path.home() / "macal")).e
 
 def _macal_root() -> Path:
     return Path.cwd() if (Path.cwd() / ".contracts.yaml").exists() else DEFAULT_MACAL_ROOT
+
+
+def _load_services(macal_root: Path) -> dict[str, ServiceContracts]:
+    """Indexed services, announcing every duplicate index file that was ignored."""
+    index = load_index(macal_root)
+    if index.shadowed:
+        console.print(
+            "[yellow]⚠ Duplicate .contracts.yaml ignored (a git worktree beside its "
+            "repo carries its own, usually stale, copy):[/yellow]"
+        )
+        for service, paths in sorted(index.shadowed.items()):
+            ignored = ", ".join(escape(p.parent.name) for p in paths)
+            winner = escape(index.sources[service].parent.name)
+            console.print(f"[yellow]  {winner}/ wins over {ignored}[/yellow]")
+        console.print(
+            "[yellow]  Move those worktrees under <repo>-worktrees/ to keep them "
+            "out of the index.[/yellow]"
+        )
+    return index.services
 
 
 def _service_root(service: str, macal_root: Path) -> Path:
@@ -95,7 +115,21 @@ def extract(
 
 
 def _discover_services(macal_root: Path) -> list[str]:
-    return sorted(p.parent.name for p in macal_root.glob("*/.contracts.yaml"))
+    """Service checkouts under macal_root, skipping git worktrees parked beside them.
+
+    A worktree carries a copy of the tracked .contracts.yaml, which still names the
+    original service — extracting it would mint a bogus service under the worktree's
+    directory name.
+    """
+    found: list[str] = []
+    for path in sorted(macal_root.glob("*/.contracts.yaml")):
+        try:
+            declared = load_one(path).service
+        except Exception:  # noqa: BLE001 - unparseable index: let extract rewrite it
+            declared = path.parent.name
+        if declared == path.parent.name:
+            found.append(path.parent.name)
+    return found
 
 
 @cli.command()
@@ -122,7 +156,7 @@ def endpoint(query: str, macal_root: Path) -> None:
     method, path = parts[0].upper(), parts[1]
     norm_query = normalize_path(path)
 
-    all_contracts = load_all_contracts(macal_root)
+    all_contracts = _load_services(macal_root)
     if not all_contracts:
         console.print(f"[red]no .contracts.yaml files found in {macal_root}[/red]")
         raise click.Abort
@@ -138,12 +172,12 @@ def endpoint(query: str, macal_root: Path) -> None:
             if cons.method == method and _consumer_covers(cons.path, norm_query):
                 consumers.append((svc_name, contracts, cons.caller, cons.line))
 
-    console.rule(f"[bold]{method} {path}[/bold]")
+    console.rule(f"[bold]{escape(method)} {escape(path)}[/bold]")
 
     if providers:
         for svc_name, _, handler, line in providers:
-            console.print(f"[green]Provider:[/green] {svc_name}")
-            console.print(f"  handler: {handler}:{line}")
+            console.print(f"[green]Provider:[/green] {escape(svc_name)}")
+            console.print(f"  handler: {escape(handler)}:{line}")
     else:
         console.print("[yellow]Provider: not found in indexed services[/yellow]")
 
@@ -151,8 +185,8 @@ def endpoint(query: str, macal_root: Path) -> None:
     if consumers:
         console.print(f"[cyan]Consumers ({len(consumers)}):[/cyan]")
         for svc_name, _, caller, line in consumers:
-            console.print(f"  • {svc_name}")
-            console.print(f"    {caller}:{line}")
+            console.print(f"  • {escape(svc_name)}")
+            console.print(f"    {escape(caller)}:{line}")
     else:
         console.print("[yellow]Consumers: 0 found in indexed services[/yellow]")
         unindexed = _unindexed_services(macal_root, all_contracts)
@@ -184,7 +218,7 @@ def _consumer_covers(consumer_path: str, norm_query: str) -> bool:
 @click.option("--macal-root", type=click.Path(path_type=Path), default=DEFAULT_MACAL_ROOT)
 def topic(topic_name: str, macal_root: Path) -> None:
     """Find publishers and subscribers for a pub/sub topic."""
-    all_contracts = load_all_contracts(macal_root)
+    all_contracts = _load_services(macal_root)
     publishers: list[tuple[str, str, str | None, int]] = []
     subscribers: list[tuple[str, str | None, int | None]] = []
 
@@ -196,15 +230,15 @@ def topic(topic_name: str, macal_root: Path) -> None:
             if sub.topic == topic_name:
                 subscribers.append((svc_name, sub.handler, sub.line))
 
-    console.rule(f"[bold]Topic: {topic_name}[/bold]")
+    console.rule(f"[bold]Topic: {escape(topic_name)}[/bold]")
 
     if publishers:
         console.print(f"[green]Publishers ({len(publishers)}):[/green]")
         for svc_name, pub_loc, schema, line in publishers:
-            console.print(f"  • {svc_name}")
-            console.print(f"    {pub_loc}:{line}")
+            console.print(f"  • {escape(svc_name)}")
+            console.print(f"    {escape(pub_loc)}:{line}")
             if schema:
-                console.print(f"    schema: {schema}")
+                console.print(f"    schema: {escape(schema)}")
     else:
         console.print("[yellow]Publishers: 0 found[/yellow]")
 
@@ -212,8 +246,8 @@ def topic(topic_name: str, macal_root: Path) -> None:
     if subscribers:
         console.print(f"[cyan]Subscribers ({len(subscribers)}):[/cyan]")
         for svc_name, handler, line in subscribers:
-            console.print(f"  • {svc_name}")
-            console.print(f"    handler: {handler}:{line}")
+            console.print(f"  • {escape(svc_name)}")
+            console.print(f"    handler: {escape(handler or '?')}:{line}")
     else:
         console.print("[yellow]Subscribers: 0 found[/yellow]")
 
@@ -222,7 +256,7 @@ def topic(topic_name: str, macal_root: Path) -> None:
 @click.option("--macal-root", type=click.Path(path_type=Path), default=DEFAULT_MACAL_ROOT)
 def orphans(macal_root: Path) -> None:
     """List topics declared but not published, or published but not subscribed."""
-    all_contracts = load_all_contracts(macal_root)
+    all_contracts = _load_services(macal_root)
 
     pub_topics: dict[str, list[str]] = {}
     sub_topics: dict[str, list[str]] = {}
@@ -245,14 +279,14 @@ def orphans(macal_root: Path) -> None:
         console.print("[yellow]Published but not subscribed:[/yellow]")
         for t in pub_no_sub:
             services = ", ".join(pub_topics[t])
-            console.print(f"  • {t}  (publishers: {services})")
+            console.print(f"  • {escape(t)}  (publishers: {escape(services)})")
         console.print()
 
     if sub_no_pub:
         console.print("[yellow]Subscribed but not published:[/yellow]")
         for t in sub_no_pub:
             services = ", ".join(sub_topics[t])
-            console.print(f"  • {t}  (subscribers: {services})")
+            console.print(f"  • {escape(t)}  (subscribers: {escape(services)})")
             console.print(
                 "    ⚠ Possible bug: subscription exists with no producer "
                 "in any indexed service."
@@ -262,7 +296,7 @@ def orphans(macal_root: Path) -> None:
     if declared_no_handler:
         console.print("[red]Declared in init-pubsub.py with no handler:[/red]")
         for svc_name, t in declared_no_handler:
-            console.print(f"  • {svc_name} ← {t}")
+            console.print(f"  • {escape(svc_name)} ← {escape(t)}")
         console.print()
 
     if not (pub_no_sub or sub_no_pub or declared_no_handler):
@@ -284,7 +318,7 @@ def validate(macal_root: Path) -> None:
             console.print(f"  [green]✓[/green] {p.relative_to(macal_root)}")
         except Exception as e:  # noqa: BLE001
             failures += 1
-            console.print(f"  [red]✗[/red] {p.relative_to(macal_root)}: {e}")
+            console.print(f"  [red]✗[/red] {escape(str(p.relative_to(macal_root)))}: {escape(str(e))}")
     if failures:
         raise click.Abort
 
@@ -293,7 +327,7 @@ def validate(macal_root: Path) -> None:
 @click.option("--macal-root", type=click.Path(path_type=Path), default=DEFAULT_MACAL_ROOT)
 def status(macal_root: Path) -> None:
     """One-line summary of every indexed service."""
-    all_contracts = load_all_contracts(macal_root)
+    all_contracts = _load_services(macal_root)
     table = Table(show_header=True, header_style="bold")
     table.add_column("service")
     table.add_column("providers", justify="right")

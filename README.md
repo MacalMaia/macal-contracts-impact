@@ -32,6 +32,8 @@ The `contracts-impact` CLI is now available globally.
 
 All commands run from your terminal. Some assume your macal repos are cloned under a single parent directory. The default is `~/macal/`; override by setting `MACAL_ROOT` in your shell profile or passing `--macal-root`.
 
+Only the direct children of that directory are indexed, one per service. `.contracts.yaml` is tracked in git, so a git worktree checked out *next to* its repo brings along its own copy of the index, usually stale. Those duplicates are ignored in favour of the directory named after the service, and every command says so. Keep worktrees under `<repo>-worktrees/` and they stay out of the index entirely.
+
 ### Find consumers of an endpoint
 
 ```bash
