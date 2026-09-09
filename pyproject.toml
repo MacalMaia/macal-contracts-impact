@@ -1,6 +1,6 @@
 [project]
 name = "contracts-impact"
-version = "0.1.0"
+version = "0.1.1"
 description = "Cross-service impact analysis for the macal platform"
 readme = "README.md"
 authors = [
