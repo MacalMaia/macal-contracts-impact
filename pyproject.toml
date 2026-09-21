@@ -1,6 +1,6 @@
 [project]
 name = "contracts-impact"
-version = "0.1.1"
+version = "0.2.0"
 description = "Cross-service impact analysis for the macal platform"
 readme = "README.md"
 authors = [
@@ -25,3 +25,7 @@ build-backend = "uv_build"
 dev = [
     "pytest>=8.0",
 ]
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
