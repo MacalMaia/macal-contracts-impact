@@ -11,9 +11,10 @@ from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
-from contracts_impact.aggregator import load_index, load_one, write_one
+from contracts_impact.aggregator import ContractIndex, load_index, load_one, write_one
 from contracts_impact.extract import extract_service
 from contracts_impact.extractors.http_clients import normalize_path
+from contracts_impact.freshness import stale_services
 from contracts_impact.models import ServiceContracts
 
 console = Console()
@@ -25,8 +26,8 @@ def _macal_root() -> Path:
     return Path.cwd() if (Path.cwd() / ".contracts.yaml").exists() else DEFAULT_MACAL_ROOT
 
 
-def _load_services(macal_root: Path) -> dict[str, ServiceContracts]:
-    """Indexed services, announcing every duplicate index file that was ignored."""
+def _load_index(macal_root: Path) -> ContractIndex:
+    """The loaded index, announcing every duplicate index file that was ignored."""
     index = load_index(macal_root)
     if index.shadowed:
         console.print(
@@ -41,7 +42,39 @@ def _load_services(macal_root: Path) -> dict[str, ServiceContracts]:
             "[yellow]  Move those worktrees under <repo>-worktrees/ to keep them "
             "out of the index.[/yellow]"
         )
-    return index.services
+    return index
+
+
+def _warn_if_stale(index: ContractIndex) -> None:
+    """Say which indexes predate their code, when the answer was empty.
+
+    Printed only where a query came back with nothing, because that is the answer
+    a stale index forges: an endpoint whose consumer was added after the index was
+    written looks exactly like an endpoint nobody calls.
+    """
+    stale = stale_services(index.sources)
+    if not stale:
+        return
+
+    if len(stale) == 1:
+        headline = f"{escape(stale[0].describe())} changed since its index was built"
+        remedy = f"contracts-impact validate --check {escape(stale[0].service)}"
+    else:
+        # Naming eight services swamps the answer they came for; the worst few
+        # carry the point.
+        worst = ", ".join(escape(s.describe()) for s in stale[:3])
+        rest = f", +{len(stale) - 3} more" if len(stale) > 3 else ""
+        headline = (
+            f"{len(stale)} of {len(index.services)} indexes are behind their code "
+            f"({worst}{rest})"
+        )
+        remedy = "contracts-impact validate --check"
+
+    # Changed sources are a cheap proxy, not proof: most edits never touch a
+    # route. `validate --check` re-extracts and says which index actually drifted,
+    # which beats regenerating every index on a suspicion.
+    console.print(f"  [yellow]⚠ {headline}. A 0 here may be a stale index.[/yellow]")
+    console.print(f"  [yellow]  Confirm with: {remedy}[/yellow]")
 
 
 def _service_root(service: str, macal_root: Path) -> Path:
@@ -156,7 +189,8 @@ def endpoint(query: str, macal_root: Path) -> None:
     method, path = parts[0].upper(), parts[1]
     norm_query = normalize_path(path)
 
-    all_contracts = _load_services(macal_root)
+    index = _load_index(macal_root)
+    all_contracts = index.services
     if not all_contracts:
         console.print(f"[red]no .contracts.yaml files found in {macal_root}[/red]")
         raise click.Abort
@@ -195,6 +229,7 @@ def endpoint(query: str, macal_root: Path) -> None:
                 f"  ⚠ Not yet indexed: {', '.join(unindexed)}. Cross-service "
                 "callers in these services will be invisible."
             )
+        _warn_if_stale(index)
 
 
 def _consumer_covers(consumer_path: str, norm_query: str) -> bool:
@@ -218,7 +253,8 @@ def _consumer_covers(consumer_path: str, norm_query: str) -> bool:
 @click.option("--macal-root", type=click.Path(path_type=Path), default=DEFAULT_MACAL_ROOT)
 def topic(topic_name: str, macal_root: Path) -> None:
     """Find publishers and subscribers for a pub/sub topic."""
-    all_contracts = _load_services(macal_root)
+    index = _load_index(macal_root)
+    all_contracts = index.services
     publishers: list[tuple[str, str, str | None, int]] = []
     subscribers: list[tuple[str, str | None, int | None]] = []
 
@@ -251,12 +287,17 @@ def topic(topic_name: str, macal_root: Path) -> None:
     else:
         console.print("[yellow]Subscribers: 0 found[/yellow]")
 
+    # Once for the whole query, not once per empty half.
+    if not publishers or not subscribers:
+        _warn_if_stale(index)
+
 
 @cli.command()
 @click.option("--macal-root", type=click.Path(path_type=Path), default=DEFAULT_MACAL_ROOT)
 def orphans(macal_root: Path) -> None:
     """List topics declared but not published, or published but not subscribed."""
-    all_contracts = _load_services(macal_root)
+    index = _load_index(macal_root)
+    all_contracts = index.services
 
     pub_topics: dict[str, list[str]] = {}
     sub_topics: dict[str, list[str]] = {}
@@ -304,10 +345,43 @@ def orphans(macal_root: Path) -> None:
 
 
 @cli.command()
+@click.argument("service", required=False)
 @click.option("--macal-root", type=click.Path(path_type=Path), default=DEFAULT_MACAL_ROOT)
-def validate(macal_root: Path) -> None:
-    """Schema-check every .contracts.yaml under macal_root."""
-    paths = sorted(macal_root.glob("*/.contracts.yaml"))
+@click.option(
+    "--repo-path",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=None,
+    help="Override the source directory for SERVICE (default: <macal-root>/<service>). "
+    "Use '.' in CI when the service repo is checked out at the workspace root.",
+)
+@click.option(
+    "--check",
+    is_flag=True,
+    help="Re-extract and fail if the committed .contracts.yaml is behind the code.",
+)
+def validate(
+    service: str | None, macal_root: Path, repo_path: Path | None, check: bool
+) -> None:
+    """Schema-check .contracts.yaml, or with --check verify it still matches the code.
+
+    Without --check this only parses the index. With --check it re-runs the
+    extractors in memory and compares, writing nothing — so it answers "is my
+    index current?" on a dirty checkout, before the PR exists and before the
+    per-repo Contracts Check workflow gets a chance to say so.
+    """
+    if repo_path is not None and service is None:
+        console.print("[red]--repo-path requires a service name argument[/red]")
+        raise click.Abort
+
+    if check:
+        _validate_freshness(service, macal_root, repo_path)
+        return
+
+    paths = (
+        [_output_path(service, macal_root)]
+        if service
+        else sorted(macal_root.glob("*/.contracts.yaml"))
+    )
     if not paths:
         console.print(f"[red]no .contracts.yaml files in {macal_root}[/red]")
         raise click.Abort
@@ -315,19 +389,113 @@ def validate(macal_root: Path) -> None:
     for p in paths:
         try:
             load_one(p)
-            console.print(f"  [green]✓[/green] {p.relative_to(macal_root)}")
+            console.print(f"  [green]✓[/green] {_display(p, macal_root)}")
         except Exception as e:  # noqa: BLE001
             failures += 1
-            console.print(f"  [red]✗[/red] {escape(str(p.relative_to(macal_root)))}: {escape(str(e))}")
+            console.print(f"  [red]✗[/red] {escape(_display(p, macal_root))}: {escape(str(e))}")
     if failures:
         raise click.Abort
+
+
+def _display(path: Path, macal_root: Path) -> str:
+    try:
+        return str(path.relative_to(macal_root))
+    except ValueError:
+        return str(path)
+
+
+def _validate_freshness(
+    service: str | None, macal_root: Path, repo_path: Path | None
+) -> None:
+    """Re-extract each target and abort if its committed index differs."""
+    if repo_path is None and not macal_root.exists():
+        console.print(
+            f"[red]--macal-root {macal_root} does not exist (use --repo-path . in CI)[/red]"
+        )
+        raise click.Abort
+
+    targets = [service] if service else _discover_services(macal_root)
+    if not targets:
+        console.print("[red]No services found to check.[/red]")
+        raise click.Abort
+
+    failures = 0
+    for svc in targets:
+        repo = repo_path if repo_path is not None else _service_root(svc, macal_root)
+        index_path = (repo / ".contracts.yaml") if repo_path is not None else _output_path(svc, macal_root)
+        if not repo.exists():
+            console.print(f"[yellow]skip {escape(svc)}: {escape(str(repo))} does not exist[/yellow]")
+            continue
+        if not index_path.exists():
+            failures += 1
+            console.print(
+                f"  [red]✗[/red] {escape(svc)}: no .contracts.yaml committed. "
+                f"Run: contracts-impact extract {escape(svc)}"
+            )
+            continue
+
+        fresh = extract_service(svc, repo)
+        committed = load_one(index_path)
+        drift = _describe_drift(fresh, committed)
+        if not drift:
+            console.print(f"  [green]✓[/green] {escape(svc)} index matches the code")
+            continue
+
+        failures += 1
+        console.print(f"  [red]✗[/red] {escape(svc)} index is behind the code:")
+        for line in drift:
+            console.print(f"      {escape(line)}")
+        console.print(f"    Run: contracts-impact extract {escape(svc)}")
+
+    if failures:
+        raise click.Abort
+
+
+def _entry_sets(c: ServiceContracts) -> dict[str, set[str]]:
+    """The contract entries a reader cares about, as comparable labels."""
+    return {
+        "provides": {f"{p.method} {p.path}" for p in c.provides.http},
+        "consumes": {f"{x.method} {x.path} → {x.target}" for x in c.consumes.http},
+        "publishes": {t.topic for t in c.provides.topics_published},
+        "subscribes": {t.topic for t in c.consumes.topics_subscribed},
+    }
+
+
+def _describe_drift(fresh: ServiceContracts, committed: ServiceContracts) -> list[str]:
+    """Lines describing how `committed` differs from a fresh extraction.
+
+    Empty when the committed file is exactly what extracting again would write.
+    The comparison is the whole serialised model, so a shifted line number counts
+    as drift too — the index is a lockfile, and a lockfile is either current or
+    it is not. Entry-level differences get named; anything subtler is reported as
+    such rather than printed as a confusing empty list.
+    """
+    if fresh.model_dump(by_alias=True, mode="json") == committed.model_dump(
+        by_alias=True, mode="json"
+    ):
+        return []
+
+    lines: list[str] = []
+    fresh_sets, committed_sets = _entry_sets(fresh), _entry_sets(committed)
+    for label in fresh_sets:
+        for entry in sorted(fresh_sets[label] - committed_sets[label]):
+            lines.append(f"+ {label}: {entry}")
+        for entry in sorted(committed_sets[label] - fresh_sets[label]):
+            lines.append(f"- {label}: {entry}")
+
+    if not lines:
+        lines.append(
+            "same entries, but line numbers, handlers or warnings moved"
+        )
+    return lines
 
 
 @cli.command()
 @click.option("--macal-root", type=click.Path(path_type=Path), default=DEFAULT_MACAL_ROOT)
 def status(macal_root: Path) -> None:
     """One-line summary of every indexed service."""
-    all_contracts = _load_services(macal_root)
+    index = _load_index(macal_root)
+    all_contracts = index.services
     table = Table(show_header=True, header_style="bold")
     table.add_column("service")
     table.add_column("providers", justify="right")

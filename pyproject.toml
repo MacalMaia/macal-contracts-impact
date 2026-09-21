@@ -25,3 +25,7 @@ build-backend = "uv_build"
 dev = [
     "pytest>=8.0",
 ]
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"

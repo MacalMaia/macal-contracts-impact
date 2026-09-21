@@ -87,6 +87,37 @@ In CI or in a single-repo checkout (no `~/macal/` parent dir):
 contracts-impact extract auction-engine --repo-path .
 ```
 
+### Check whether an index still matches the code
+
+```bash
+contracts-impact validate --check macal-maia-front
+```
+```
+  ✗ macal-maia-front index is behind the code:
+      + consumes: GET /api/v4/operaciones/agendamiento/propiedades → macal-api
+      + consumes: POST /api/v4/operaciones/agendamiento/aprobar-masivo → macal-api
+    Run: contracts-impact extract macal-maia-front
+```
+
+Re-runs the extractors in memory and compares against the committed `.contracts.yaml`, exiting non-zero on any difference. It writes nothing, so it is safe to run on a dirty checkout before pushing. Without `--check`, `validate` still just schema-checks the index files as before.
+
+## Stale indexes
+
+`.contracts.yaml` is generated and committed, so it drifts behind the code between the moment you write a route and the moment CI regenerates it. An index that predates your change answers `0 consumers` for endpoints that *are* consumed, and that zero is indistinguishable from a real one.
+
+When a query comes back empty, the CLI now says whether any index is behind its code:
+
+```
+Consumers: 0 found in indexed services
+  ⚠ 8 of 8 indexes are behind their code (macal-new-web (116 committed),
+    macal-maia-front (6 committed, 20 uncommitted), …). A 0 here may be a stale index.
+    Confirm with: contracts-impact validate --check
+```
+
+The signal comes from git — the commit that last wrote the index, versus the source files that moved since — so it needs no change to the file format and works on indexes that already exist. It only counts files the extractors actually read (`.py` for backends, `.ts/.tsx/.js/.jsx/.vue/.mjs` for frontends), and stays silent outside a git checkout. Nothing is printed on a non-empty answer.
+
+Changed sources are a cheap proxy, not proof: most edits never touch a route, so the warning over-reports on purpose. It points at `validate --check`, which re-extracts and says which index actually drifted. On the run above, 8 services had changed sources and exactly one had a contract that moved.
+
 ## CI integration
 
 Each macal repo has a `.github/workflows/contracts-check.yml` that:
@@ -95,6 +126,10 @@ Each macal repo has a `.github/workflows/contracts-check.yml` that:
 3. Fails the PR if `.contracts.yaml` drifted from what the code says
 
 This keeps the contracts file honest without depending on developer discipline. If your edit broke the contract, the CI tells you.
+
+Steps 2 and 3 can be collapsed into `contracts-impact validate --check <service> --repo-path .`, which reports the drift as endpoints gained and lost instead of a YAML text diff, and leaves the checkout clean rather than rewriting `.contracts.yaml` in order to diff it.
+
+The workflow fires on pull requests and on pushes to `main`/`master`/`staging`, so it says nothing about a feature branch until the PR exists. That window — code written, PR not yet opened — is exactly when the index is behind and cross-service queries answer from it. That is what the stale-index warning above covers.
 
 If the contracts repo is private, your CI needs a deploy key or a GitHub token with read access to `MacalMaia/macal-contracts-impact`.
 
