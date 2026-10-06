@@ -164,7 +164,7 @@ def _fixture_repo(fixtures_root: Path, tmp_path: Path) -> Path:
 
 def _run_check(repo: Path) -> Result:
     return CliRunner().invoke(
-        cli, ["validate", "--check", "fastapi-svc", "--repo-path", str(repo)]
+        cli, ["validate", "--check", "macal-api", "--repo-path", str(repo)]
     )
 
 
@@ -178,7 +178,7 @@ def test_validate_check_passes_on_a_freshly_extracted_index(
     """
     repo = _fixture_repo(fixtures_root, tmp_path)
     extracted = CliRunner().invoke(
-        cli, ["extract", "fastapi-svc", "--repo-path", str(repo)]
+        cli, ["extract", "macal-api", "--repo-path", str(repo)]
     )
     assert extracted.exit_code == 0, f"crashed with: {extracted.output}"
 
@@ -191,7 +191,7 @@ def test_validate_check_fails_and_names_what_the_index_is_missing(
     fixtures_root: Path, tmp_path: Path
 ) -> None:
     repo = _fixture_repo(fixtures_root, tmp_path)
-    CliRunner().invoke(cli, ["extract", "fastapi-svc", "--repo-path", str(repo)])
+    CliRunner().invoke(cli, ["extract", "macal-api", "--repo-path", str(repo)])
 
     index_path = repo / ".contracts.yaml"
     contracts = load_one(index_path)
