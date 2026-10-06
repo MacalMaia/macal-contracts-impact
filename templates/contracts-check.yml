@@ -1,8 +1,9 @@
 # Per-repo CI check that fails if .contracts.yaml drifts from what the code says.
 #
 # Copy this file to .github/workflows/contracts-check.yml in each macal repo
-# and replace `<SERVICE_NAME>` below with the repo's service name, as listed in
-# KNOWN_SERVICES (src/contracts_impact/extract.py).
+# and replace `<SERVICE_NAME>` below with the repo's service name, as registered in
+# KNOWN_SERVICES (MacalMaia/macal-contracts-impact: src/contracts_impact/extract.py).
+# Unregistered names are rejected.
 #
 # If MacalMaia/macal-contracts-impact is private, the workflow needs a deploy key or
 # a fine-grained personal access token with read access stored in a repo secret

@@ -14,22 +14,22 @@ from contracts_impact.extractors import (
 )
 from contracts_impact.models import Consumes, Provides, ServiceContracts
 
-FRONTEND_SERVICES: set[str] = {
+FRONTEND_SERVICES: frozenset[str] = frozenset({
     "auctioneer-front",
     "macal-maia-front",
     "macal-new-web",
     "maia-banks",
     "maia-inmobiliarias",
-}
+})
 
-BACKEND_SERVICES: set[str] = {
+BACKEND_SERVICES: frozenset[str] = frozenset({
     "auction-engine",
     "macal-api",
     "macal-users-api",
     "payment-gateway",
-}
+})
 
-KNOWN_SERVICES: set[str] = FRONTEND_SERVICES | BACKEND_SERVICES
+KNOWN_SERVICES: frozenset[str] = FRONTEND_SERVICES | BACKEND_SERVICES
 
 
 def find_app_root(service_dir: Path) -> Path:
@@ -43,7 +43,21 @@ def find_app_root(service_dir: Path) -> Path:
     return service_dir
 
 
+class UnknownServiceError(ValueError):
+    pass
+
+
+def require_known_service(service_name: str) -> None:
+    """An unregistered name would silently fall through to the backend extractors."""
+    if service_name not in KNOWN_SERVICES:
+        raise UnknownServiceError(
+            f"Unknown service {service_name!r}; register it in KNOWN_SERVICES "
+            f"({', '.join(sorted(KNOWN_SERVICES))})"
+        )
+
+
 def extract_service(service_name: str, repo_root: Path) -> ServiceContracts:
+    require_known_service(service_name)
     repo_root = find_app_root(repo_root)
     contracts = ServiceContracts.new(service=service_name, repo_path=repo_root)
 

@@ -12,7 +12,12 @@ from rich.markup import escape
 from rich.table import Table
 
 from contracts_impact.aggregator import ContractIndex, load_index, load_one, write_one
-from contracts_impact.extract import KNOWN_SERVICES, extract_service
+from contracts_impact.extract import (
+    KNOWN_SERVICES,
+    UnknownServiceError,
+    extract_service,
+    require_known_service,
+)
 from contracts_impact.extractors.http_clients import normalize_path
 from contracts_impact.freshness import stale_services
 from contracts_impact.models import ServiceContracts
@@ -118,7 +123,7 @@ def extract(
         console.print(f"[red]--macal-root {macal_root} does not exist (use --repo-path . in CI)[/red]")
         raise click.Abort
 
-    targets = [service] if service else _discover_services(macal_root)
+    targets = _resolve_targets(service, macal_root)
     if not targets:
         console.print("[red]No services found to extract.[/red]")
         raise click.Abort
@@ -145,6 +150,18 @@ def extract(
             f"{len(contracts.event_schemas)} schemas, "
             f"{len(contracts.extraction_warnings)} warnings)"
         )
+
+
+def _resolve_targets(service: str | None, macal_root: Path) -> list[str]:
+    """The named service (which must be registered) or every service discovered."""
+    if service is None:
+        return _discover_services(macal_root)
+    try:
+        require_known_service(service)
+    except UnknownServiceError as exc:
+        console.print(f"[red]{escape(str(exc))}[/red]")
+        raise click.Abort from exc
+    return [service]
 
 
 def _discover_services(macal_root: Path) -> list[str]:
@@ -223,7 +240,7 @@ def endpoint(query: str, macal_root: Path) -> None:
             console.print(f"    {escape(caller)}:{line}")
     else:
         console.print("[yellow]Consumers: 0 found in indexed services[/yellow]")
-        unindexed = _unindexed_services(macal_root, all_contracts)
+        unindexed = sorted(KNOWN_SERVICES - set(all_contracts))
         if unindexed:
             console.print(
                 f"  ⚠ Not yet indexed: {', '.join(unindexed)}. Cross-service "
@@ -414,7 +431,7 @@ def _validate_freshness(
         )
         raise click.Abort
 
-    targets = [service] if service else _discover_services(macal_root)
+    targets = _resolve_targets(service, macal_root)
     if not targets:
         console.print("[red]No services found to check.[/red]")
         raise click.Abort
@@ -515,10 +532,3 @@ def status(macal_root: Path) -> None:
             str(len(c.extraction_warnings)),
         )
     console.print(table)
-
-
-def _unindexed_services(
-    macal_root: Path, indexed: dict[str, ServiceContracts]
-) -> list[str]:
-    """Return macal subdirs that look like services but have no .contracts.yaml."""
-    return sorted(KNOWN_SERVICES - set(indexed))
