@@ -12,7 +12,7 @@ from rich.markup import escape
 from rich.table import Table
 
 from contracts_impact.aggregator import ContractIndex, load_index, load_one, write_one
-from contracts_impact.extract import extract_service
+from contracts_impact.extract import KNOWN_SERVICES, extract_service
 from contracts_impact.extractors.http_clients import normalize_path
 from contracts_impact.freshness import stale_services
 from contracts_impact.models import ServiceContracts
@@ -521,14 +521,4 @@ def _unindexed_services(
     macal_root: Path, indexed: dict[str, ServiceContracts]
 ) -> list[str]:
     """Return macal subdirs that look like services but have no .contracts.yaml."""
-    known_services = {
-        "auction-engine",
-        "auctioneer-front",
-        "macal-api",
-        "macal-maia-front",
-        "macal-new-web",
-        "macal-users-api",
-        "maia-banks",
-        "payment-gateway",
-    }
-    return sorted(known_services - set(indexed))
+    return sorted(KNOWN_SERVICES - set(indexed))

@@ -19,7 +19,17 @@ FRONTEND_SERVICES: set[str] = {
     "macal-maia-front",
     "macal-new-web",
     "maia-banks",
+    "maia-inmobiliarias",
 }
+
+BACKEND_SERVICES: set[str] = {
+    "auction-engine",
+    "macal-api",
+    "macal-users-api",
+    "payment-gateway",
+}
+
+KNOWN_SERVICES: set[str] = FRONTEND_SERVICES | BACKEND_SERVICES
 
 
 def find_app_root(service_dir: Path) -> Path:
